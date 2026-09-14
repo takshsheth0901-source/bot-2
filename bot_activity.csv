@@ -152,3 +152,4 @@ timestamp,decision,score,equity,action
 2026-09-14T05:52:20.348349,error,,,404 Client Error: Not Found for url: https://api-fxpractice.oanda.com/v3/accounts/101-004-40390415-001/positions/XAU_USD
 2026-09-14T06:01:32.962378,hold,0,100000.0,none
 2026-09-14T06:26:14.706867,error,,,404 Client Error: Not Found for url: https://api-fxpractice.oanda.com/v3/accounts/101-004-40390415-001/positions/XAU_USD
+2026-09-14T06:45:23.317985,error,,,404 Client Error: Not Found for url: https://api-fxpractice.oanda.com/v3/accounts/101-004-40390415-001/positions/XAU_USD
