@@ -1,5 +1,17 @@
 """
 GOLD TRADING BOT - OANDA VERSION (single-run, for GitHub Actions)
+
+Trades XAU/USD (spot gold) directly through OANDA's REST v20 API.
+Unlike the Trading212 version, this pulls candle/price data from OANDA
+itself, so there's no separate data source needed.
+
+Runs ONCE per execution: checks the market, scores signals, trades if
+conditions and risk limits allow, logs the result, exits. GitHub Actions
+calls this on a schedule (see .github/workflows/trading-bot.yml).
+
+Required GitHub Secrets (only 2):
+  OANDA_API_TOKEN   - your personal access token
+  OANDA_ACCOUNT_ID  - e.g. 101-004-40390415-001
 """
 
 import csv
@@ -11,18 +23,34 @@ import requests
 import pandas as pd
 import numpy as np
 
-USE_DEMO_ACCOUNT = True
-INSTRUMENT = "XAU_USD"
-GRANULARITY = "M5"
-CANDLE_COUNT = 200
+
+# ============================================================
+# SETTINGS - hardcoded, edit directly in this file if you want
+# to change behaviour. Nothing here is secret.
+# ============================================================
+
+USE_DEMO_ACCOUNT = True   # change to False only when ready for real money
+
+INSTRUMENT = "XAU_USD"    # spot gold vs US dollar - fixed ticker on OANDA
+GRANULARITY = "M1"        # 1-minute candles for faster-updating scalp signals
+CANDLE_COUNT = 300        # how many recent candles to pull each run
+
+# --- Scalping exit settings ---
+# Every trade gets a stop-loss and take-profit attached at open time, so
+# OANDA closes it automatically the instant price hits either level -
+# this is what makes fast in/out trades possible even though our check-ins
+# are only every 5 minutes (GitHub Actions' free-tier minimum).
+STOP_LOSS_PCT = 0.15      # close for a small loss if price moves 0.15% against us
+TAKE_PROFIT_PCT = 0.30    # close for a small win if price moves 0.30% in our favor
+ALLOW_SHORTING = True     # let sell signals open a short position, not just close a long
 
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
-BUY_SCORE_THRESHOLD = 1
-SELL_SCORE_THRESHOLD = -1
+BUY_SCORE_THRESHOLD = 2
+SELL_SCORE_THRESHOLD = -2
 
 BB_PERIOD = 20
 BB_STD_DEV = 2
@@ -31,20 +59,26 @@ VOLUME_SPIKE_MULT = 1.5
 FIB_LOOKBACK = 40
 FIB_TOLERANCE_PCT = 0.3
 
-MAX_TRADES_PER_DAY = 1000
-MAX_POSITION_FRACTION = 0.10
-DAILY_LOSS_LIMIT_FRACTION = 0.03
-COOLDOWN_SECONDS_AFTER_TRADE = 300
+MAX_TRADES_PER_DAY = 30               # raised for scalping - still a hard cap, not unlimited
+MAX_POSITION_FRACTION = 0.30          # bigger stake per trade, per your request
+DAILY_LOSS_LIMIT_FRACTION = 0.03      # stop trading if down 3% today
+COOLDOWN_SECONDS_AFTER_TRADE = 120    # shorter cooldown to match faster trading style
 KILL_SWITCH_FILE = "STOP"
 
 LOG_FILE = "bot_activity.csv"
-STATE_FILE = "bot_state.csv"
+STATE_FILE = "bot_state.csv"   # tracks trades-today / last-trade-time across runs
+
+# ============================================================
+# API CREDENTIALS - the only things that must be set as GitHub Secrets
+# ============================================================
 
 OANDA_API_TOKEN = os.environ.get("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 
 BASE_URL = "https://api-fxpractice.oanda.com" if USE_DEMO_ACCOUNT else "https://api-fxtrade.oanda.com"
 
+
+# ---------------- OANDA API ----------------
 
 def oanda_session():
     s = requests.Session()
@@ -75,34 +109,45 @@ def get_open_position(session, instrument):
         data = oanda_request(session, "GET", f"/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}")
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            return 0.0
+            return 0.0  # no position exists yet - not an error
         raise
     pos = data.get("position", {})
     long_units = float(pos.get("long", {}).get("units", 0))
     short_units = float(pos.get("short", {}).get("units", 0))
-    return long_units + short_units
+    return long_units + short_units   # net units, positive = long, negative = short
 
 
-def place_market_order(session, instrument, units):
-    body = {
-        "order": {
-            "type": "MARKET",
-            "instrument": instrument,
-            "units": str(int(units)),
-            "timeInForce": "FOK",
-            "positionFill": "DEFAULT",
-        }
+def place_market_order(session, instrument, units, stop_loss_price=None, take_profit_price=None):
+    """
+    units > 0 = buy (go long), units < 0 = sell (go short, or close a long).
+    Attaching stop_loss/take_profit prices means OANDA closes the trade
+    automatically the instant price reaches either level - even between
+    our scheduled check-ins. This is what makes fast in-and-out trades
+    possible despite only checking in every 5 minutes.
+    """
+    order = {
+        "type": "MARKET",
+        "instrument": instrument,
+        "units": str(int(units)),
+        "timeInForce": "FOK",
+        "positionFill": "DEFAULT",
     }
+    if stop_loss_price is not None:
+        order["stopLossOnFill"] = {"price": f"{stop_loss_price:.2f}"}
+    if take_profit_price is not None:
+        order["takeProfitOnFill"] = {"price": f"{take_profit_price:.2f}"}
+
+    body = {"order": order}
     return oanda_request(session, "POST", f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", json=body)
 
 
 def get_candles(session, instrument=INSTRUMENT, granularity=GRANULARITY, count=CANDLE_COUNT):
-    params = {"granularity": granularity, "count": count, "price": "M"}
+    params = {"granularity": granularity, "count": count, "price": "M"}  # M = midpoint prices
     data = oanda_request(session, "GET", f"/v3/instruments/{instrument}/candles", params=params)
     rows = []
     for c in data["candles"]:
         if not c.get("complete", False):
-            continue
+            continue  # skip the current, still-forming candle
         mid = c["mid"]
         rows.append({
             "time": c["time"],
@@ -115,6 +160,8 @@ def get_candles(session, instrument=INSTRUMENT, granularity=GRANULARITY, count=C
     df = pd.DataFrame(rows).set_index("time")
     return df
 
+
+# ---------------- Indicators, patterns, ICT structure ----------------
 
 def add_indicators(df):
     delta = df["Close"].diff()
@@ -237,7 +284,7 @@ def score_row(row):
 
     atr_pct = row.get("ATR_pct")
     if atr_pct is not None and not pd.isna(atr_pct) and atr_pct < 0.02:
-        score = 0
+        score = 0   # market too quiet - signals unreliable
 
     return score
 
@@ -263,6 +310,8 @@ def latest_decision(df):
         decision = "hold"
     return decision, score, last_row
 
+
+# ---------------- Risk state (persisted across runs via a committed CSV) ----------------
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -310,6 +359,8 @@ def approve_trade(state, equity):
     return True, "OK"
 
 
+# ---------------- Logging ----------------
+
 def log_row(row):
     exists = os.path.exists(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
@@ -318,6 +369,8 @@ def log_row(row):
             writer.writeheader()
         writer.writerow(row)
 
+
+# ---------------- Main (runs ONCE) ----------------
 
 def main():
     ts = datetime.utcnow().isoformat()
@@ -342,26 +395,49 @@ def main():
         if decision in ("buy", "sell") and approved:
             price = float(last_row["Close"])
             current_position = get_open_position(session, INSTRUMENT)
+            units = 0
+            stop_loss_price = None
+            take_profit_price = None
 
             if decision == "buy":
                 if current_position > 0:
                     action = "skipped (already long)"
-                    units = 0
+                elif current_position < 0:
+                    # currently short - close it by buying back the exact amount
+                    units = abs(current_position)
+                    action_label = "close short"
                 else:
                     cash_to_risk = equity * MAX_POSITION_FRACTION
-                    units = int(cash_to_risk // price)
-            else:
-                if current_position <= 0:
-                    action = "skipped (nothing to sell)"
-                    units = 0
-                else:
+                    units = int(cash_to_risk // price)  # 1 unit = 1 oz of gold on OANDA
+                    stop_loss_price = price * (1 - STOP_LOSS_PCT / 100)
+                    take_profit_price = price * (1 + TAKE_PROFIT_PCT / 100)
+                    action_label = "buy"
+
+            else:  # sell
+                if current_position < 0:
+                    action = "skipped (already short)"
+                elif current_position > 0:
+                    # currently long - close it by selling the exact amount held
                     units = -abs(current_position)
+                    action_label = "close long"
+                elif ALLOW_SHORTING:
+                    cash_to_risk = equity * MAX_POSITION_FRACTION
+                    units = -int(cash_to_risk // price)  # negative units = short
+                    stop_loss_price = price * (1 + STOP_LOSS_PCT / 100)   # stop is ABOVE entry for a short
+                    take_profit_price = price * (1 - TAKE_PROFIT_PCT / 100)  # target is BELOW entry for a short
+                    action_label = "open short"
+                else:
+                    action = "skipped (nothing to sell, shorting disabled)"
 
             if units != 0:
-                place_market_order(session, INSTRUMENT, units)
+                place_market_order(session, INSTRUMENT, units,
+                                    stop_loss_price=stop_loss_price,
+                                    take_profit_price=take_profit_price)
                 state["trades_today"] += 1
                 state["last_trade_time"] = time.time()
-                action = f"{decision} units={units}"
+                action = f"{action_label} units={units}"
+                if stop_loss_price:
+                    action += f" SL={stop_loss_price:.2f} TP={take_profit_price:.2f}"
 
         elif decision in ("buy", "sell") and not approved:
             action = f"blocked: {reason}"
