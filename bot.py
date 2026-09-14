@@ -71,7 +71,12 @@ def get_account_summary(session):
 
 
 def get_open_position(session, instrument):
-    data = oanda_request(session, "GET", f"/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}")
+    try:
+        data = oanda_request(session, "GET", f"/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}")
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return 0.0
+        raise
     pos = data.get("position", {})
     long_units = float(pos.get("long", {}).get("units", 0))
     short_units = float(pos.get("short", {}).get("units", 0))
