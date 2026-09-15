@@ -275,3 +275,4 @@ timestamp,decision,score,equity,action
 2026-09-15T11:51:18.524009,buy,4,100132.4925,buy units=7 SL=4277.82 TP=4297.10
 2026-09-15T12:00:06.167222,error,,,401 Client Error: Unauthorized for url: https://api-fxpractice.oanda.com/v3/instruments/XAU_USD/candles?granularity=M1&count=300&price=M
 2026-09-15T12:21:47.375832,sell,-6,100095.8389,open short units=-7 SL=4278.65 TP=4259.43
+2026-09-15T12:39:38.549931,buy,4,100063.0159,buy units=7 SL=4274.32 TP=4293.58
