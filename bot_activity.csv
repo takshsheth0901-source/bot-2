@@ -227,3 +227,4 @@ timestamp,decision,score,equity,action
 2026-09-14T23:44:07.397797,sell,-4,100028.7776,skipped (already short)
 2026-09-14T23:52:58.507598,sell,-6,100035.7747,skipped (already short)
 2026-09-15T00:03:03.176803,sell,-6,100037.9753,skipped (already short)
+2026-09-15T00:28:35.419600,hold,-2,100038.1583,none
