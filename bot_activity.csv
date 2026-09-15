@@ -302,3 +302,4 @@ timestamp,decision,score,equity,action
 2026-09-15T17:56:13.358552,buy,7,99977.9849,buy units=6 SL=4288.81 TP=4308.14
 2026-09-15T18:09:44.191340,buy,5,99983.7158,skipped (already long)
 2026-09-15T18:26:00.323639,buy,9,100024.9123,skipped (already long)
+2026-09-15T18:41:44.749372,hold,0,100018.0944,none
