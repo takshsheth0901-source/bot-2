@@ -256,3 +256,4 @@ timestamp,decision,score,equity,action
 2026-09-15T07:11:21.003387,sell,-10,100056.8959,skipped (already short)
 2026-09-15T07:29:07.769208,hold,0,100052.4006,none
 2026-09-15T07:45:13.786667,sell,-8,100071.4851,skipped (already short)
+2026-09-15T07:57:33.376428,sell,-4,100101.8633,open short units=-7 SL=4284.99 TP=4265.74
