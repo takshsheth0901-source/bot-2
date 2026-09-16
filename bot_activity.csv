@@ -412,3 +412,4 @@ timestamp,decision,score,equity,action
 2026-09-16T18:25:12.345279,sell,-5,100229.2433,blocked: Max trades/day reached
 2026-09-16T18:41:55.960502,sell,-6,100229.2433,blocked: Max trades/day reached
 2026-09-16T18:54:19.677381,sell,-7,100229.2433,blocked: Max trades/day reached
+2026-09-16T19:04:50.683962,hold,0,100229.2433,none
