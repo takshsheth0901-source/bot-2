@@ -367,3 +367,4 @@ timestamp,decision,score,equity,action
 2026-09-16T07:57:44.899819,sell,-4,100092.1537,close long units=-6.0
 2026-09-16T08:14:24.704340,sell,-4,100092.6935,open short units=-6 SL=4334.07 TP=4314.59
 2026-09-16T08:29:47.701681,buy,4,100063.1384,buy units=6 SL=4326.87 TP=4346.38
+2026-09-16T08:45:56.240668,sell,-6,100029.3054,open short units=-6 SL=4334.93 TP=4315.45
