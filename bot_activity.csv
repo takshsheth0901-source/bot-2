@@ -357,3 +357,4 @@ timestamp,decision,score,equity,action
 2026-09-16T05:36:00.954303,buy,7,100129.6807,skipped (already long)
 2026-09-16T05:47:51.569755,buy,5,100136.1979,skipped (already long)
 2026-09-16T05:56:54.646489,hold,0,100136.407,none
+2026-09-16T06:14:28.655075,buy,5,100117.2189,skipped (already long)
