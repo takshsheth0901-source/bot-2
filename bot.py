@@ -129,6 +129,22 @@ def place_market_order(session, instrument, units, stop_loss_price=None, take_pr
     )
 
 
+def get_instrument_margin_rate(session, instrument):
+    """Returns the margin rate (e.g. 0.05 = 5%, meaning 20:1 leverage) for the instrument."""
+    try:
+        data = oanda_request(
+            session, "GET",
+            f"/v3/accounts/{OANDA_ACCOUNT_ID}/instruments",
+            params={"instruments": instrument},
+        )
+        instruments = data.get("instruments", [])
+        if instruments:
+            return float(instruments[0]["marginRate"])
+    except Exception:
+        pass
+    return 0.05  # safe fallback assumption: 5% margin (20:1 leverage)
+
+
 def get_candles(session, instrument, granularity, count):
     params = {"granularity": granularity, "count": count, "price": "M"}
     data = oanda_request(
@@ -569,6 +585,7 @@ def main():
 
     account = get_account_summary(session)
     equity = account["nav"]
+    margin_available = account["margin_available"]
 
     df = get_candles(session, INSTRUMENT, GRANULARITY, CANDLE_COUNT)
     if len(df) < 60:
@@ -605,10 +622,20 @@ def main():
         else:
             stop_distance = price * STOP_LOSS_PCT / 100
             risk_amount = equity * MAX_POSITION_FRACTION
-            units = int(risk_amount / stop_distance) if stop_distance > 0 else 0
+            risk_based_units = int(risk_amount / stop_distance) if stop_distance > 0 else 0
+
+            margin_rate = get_instrument_margin_rate(session, INSTRUMENT)
+            margin_safety_buffer = 0.9
+            margin_based_units = int((margin_available * margin_safety_buffer) / (price * margin_rate)) if price > 0 and margin_rate > 0 else 0
+
+            units = min(risk_based_units, margin_based_units)
+            was_margin_capped = margin_based_units < risk_based_units
 
             if units <= 0:
-                reason = "computed 0 units (risk_amount too small vs stop_distance)"
+                if was_margin_capped:
+                    reason = f"computed 0 units — insufficient margin (available={margin_available:.2f}, needed for {risk_based_units} units)"
+                else:
+                    reason = "computed 0 units (risk_amount too small vs stop_distance)"
             elif decision == "buy" and current_position <= 0:
                 sl_price = price * (1 - STOP_LOSS_PCT / 100)
                 tp_price = price * (1 + TAKE_PROFIT_PCT / 100)
@@ -616,7 +643,7 @@ def main():
                 if "orderFillTransaction" in order_response:
                     action = "buy"
                     units_placed = units
-                    reason = "buy order FILLED"
+                    reason = "buy order FILLED" + (" (margin-capped size)" if was_margin_capped else "")
                 elif "orderCancelTransaction" in order_response:
                     cancel_reason = order_response["orderCancelTransaction"].get("reason", "UNKNOWN")
                     reason = f"buy order REJECTED by OANDA: {cancel_reason}"
@@ -629,7 +656,7 @@ def main():
                 if "orderFillTransaction" in order_response:
                     action = "sell"
                     units_placed = -units
-                    reason = "sell order FILLED"
+                    reason = "sell order FILLED" + (" (margin-capped size)" if was_margin_capped else "")
                 elif "orderCancelTransaction" in order_response:
                     cancel_reason = order_response["orderCancelTransaction"].get("reason", "UNKNOWN")
                     reason = f"sell order REJECTED by OANDA: {cancel_reason}"
