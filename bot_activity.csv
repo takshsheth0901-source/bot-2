@@ -499,3 +499,4 @@ timestamp,decision,score,equity,action
 2026-09-17T13:33:32.603098+00:00,4366.74,-4,sell,sell,-1,1002.0515,4.0,1,sell order FILLED (margin-capped size)
 2026-09-17T13:47:16.476616+00:00,4364.495,-3,sell,sell,-4,985.4156,0.0,1,sell order FILLED (margin-capped size)
 2026-09-17T13:57:19.242680+00:00,4368.69,4,buy,none,0,968.6215,0.0,1,daily loss limit reached
+2026-09-17T14:13:00.974084+00:00,4372.75,5,buy,none,0,968.6215,0.0,1,daily loss limit reached
