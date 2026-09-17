@@ -473,3 +473,4 @@ timestamp,decision,score,equity,action
 2026-09-17T07:49:22.998049+00:00,4332.835,3,buy,buy,7,1000.0,0.0,-1,buy order placed
 2026-09-17T07:58:24.634456+00:00,4325.64,-5,sell,sell,-7,1000.0,0.0,-1,sell order placed
 2026-09-17T08:15:36.336457+00:00,4320.235,-6,sell,sell,-7,1000.0,0.0,-1,sell order placed
+2026-09-17T08:32:04.435331+00:00,4314.35,-3,sell,sell,-7,1000.0,0.0,-1,sell order placed
