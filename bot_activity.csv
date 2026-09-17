@@ -489,3 +489,4 @@ timestamp,decision,score,equity,action
 2026-09-17T11:07:42.068603+00:00,4329.545,2,buy,none,0,1000.0,0.0,-1,buy order REJECTED by OANDA: INSUFFICIENT_MARGIN
 2026-09-17T11:22:35.065738+00:00,4332.355,3,buy,none,0,1000.0,0.0,-1,buy order REJECTED by OANDA: INSUFFICIENT_MARGIN
 2026-09-17T11:34:28.984295+00:00,4326.72,-5,sell,sell,-4,1000.0,0.0,-1,sell order FILLED (margin-capped size)
+2026-09-17T11:46:37.952820+00:00,4326.73,3,buy,buy,1,998.3686,-4.0,-1,buy order FILLED (margin-capped size)
