@@ -261,7 +261,7 @@ def add_stochastic(df, k_period=14, d_period=3):
 def add_cci(df, period=20):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     sma = tp.rolling(period).mean()
-    mad = tp.rolling(period).apply(lambda x: (x - x.mean()).abs().mean(), raw=True)
+    mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
     df["cci"] = (tp - sma) / (0.015 * mad.replace(0, np.nan))
     return df
 
