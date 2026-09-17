@@ -493,3 +493,4 @@ timestamp,decision,score,equity,action
 2026-09-17T11:56:31.567490+00:00,4342.385,0,none,none,0,986.043,0.0,-1,no signal
 2026-09-17T12:12:59.090203+00:00,4354.16,3,buy,buy,4,986.043,0.0,-1,buy order FILLED (margin-capped size)
 2026-09-17T12:33:17.051998+00:00,4369.49,3,buy,buy,4,1026.6282,0.0,-1,buy order FILLED (margin-capped size)
+2026-09-17T12:50:22.144167+00:00,4366.43,4,buy,buy,4,1006.8546,0.0,-1,buy order FILLED (margin-capped size)
