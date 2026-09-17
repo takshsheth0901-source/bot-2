@@ -581,3 +581,6 @@ timestamp,decision,score,equity,action
 2026-09-17T23:14:48.693739+00:00,XAU_USD,4345.225,2,buy,none,0,964.6917,-4.0,1,"computed 0 units — insufficient margin (available=92.34, needed for 7 units)"
 2026-09-17T23:14:49.417448+00:00,EUR_USD,1.14782,0,none,none,0,964.7423,0.0,-3,no signal
 2026-09-17T23:14:49.785377+00:00,GBP_USD,1.33594,0,none,none,0,964.7423,-6689.0,-3,no signal
+2026-09-17T23:24:41.002351+00:00,XAU_USD,4346.81,2,buy,none,0,959.5302,-4.0,1,"computed 0 units — insufficient margin (available=87.19, needed for 7 units)"
+2026-09-17T23:24:41.708456+00:00,EUR_USD,1.1478,0,none,none,0,959.5302,0.0,-3,no signal
+2026-09-17T23:24:42.034533+00:00,GBP_USD,1.33595,0,none,none,0,959.1673,-6689.0,-3,no signal
