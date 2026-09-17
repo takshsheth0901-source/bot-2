@@ -1,76 +1,62 @@
 """
-GOLD TRADING BOT - OANDA VERSION (single-run, for GitHub Actions)
-
-Trades XAU/USD (spot gold) directly through OANDA's REST v20 API.
-Unlike the Trading212 version, this pulls candle/price data from OANDA
-itself, so there's no separate data source needed.
-
-Runs ONCE per execution: checks the market, scores signals, trades if
-conditions and risk limits allow, logs the result, exits. GitHub Actions
-calls this on a schedule (see .github/workflows/trading-bot.yml).
-
-Required GitHub Secrets (only 2):
-  OANDA_API_TOKEN   - your personal access token
-  OANDA_ACCOUNT_ID  - e.g. 101-004-40390415-001
+Automated Gold (XAU/USD) trading bot for OANDA.
+Runs once per invocation — intended to be triggered every 5 minutes by GitHub Actions.
 """
 
-import csv
 import os
-import time
-from datetime import date, datetime
+import sys
+import json
+import csv
+from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
 import numpy as np
 
+# ══════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════
 
-# ============================================================
-# SETTINGS - hardcoded, edit directly in this file if you want
-# to change behaviour. Nothing here is secret.
-# ============================================================
-
-USE_DEMO_ACCOUNT = True   # change to False only when ready for real money
-
-INSTRUMENT = "XAU_USD"    # spot gold vs US dollar - fixed ticker on OANDA
-GRANULARITY = "M1"        # 1-minute candles for faster-updating scalp signals
-CANDLE_COUNT = 300        # how many recent candles to pull each run
-
-# --- Scalping exit settings ---
-STOP_LOSS_PCT = 0.15
-TAKE_PROFIT_PCT = 0.30
-ALLOW_SHORTING = True
-
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
-
-BUY_SCORE_THRESHOLD = 4    # raised from 2 since the signal pool nearly doubled - keeps meaningful confluence
-SELL_SCORE_THRESHOLD = -4
-
-BB_PERIOD = 20
-BB_STD_DEV = 2
-ATR_PERIOD = 14
-VOLUME_SPIKE_MULT = 1.5
-FIB_LOOKBACK = 40
-FIB_TOLERANCE_PCT = 0.3
-
-MAX_TRADES_PER_DAY = 30
-MAX_POSITION_FRACTION = 0.30
-DAILY_LOSS_LIMIT_FRACTION = 0.03
-COOLDOWN_SECONDS_AFTER_TRADE = 120
-KILL_SWITCH_FILE = "STOP"
-
-LOG_FILE = "bot_activity.csv"
-STATE_FILE = "bot_state.csv"
+USE_DEMO_ACCOUNT = True
 
 OANDA_API_TOKEN = os.environ.get("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 
-BASE_URL = "https://api-fxpractice.oanda.com" if USE_DEMO_ACCOUNT else "https://api-fxtrade.oanda.com"
+INSTRUMENT = "XAU_USD"
+GRANULARITY = "M1"
+CANDLE_COUNT = 300
 
+STOP_LOSS_PCT = 0.15
+TAKE_PROFIT_PCT = 0.30
+ALLOW_SHORTING = True
 
-# ---------------- OANDA API ----------------
+BUY_SCORE_THRESHOLD = 1
+SELL_SCORE_THRESHOLD = -1
+
+MAX_TRADES_PER_DAY = 30
+MAX_POSITION_FRACTION = 0.05
+DAILY_LOSS_LIMIT_FRACTION = 0.03
+COOLDOWN_SECONDS_AFTER_TRADE = 120
+KILL_SWITCH_FILE = "STOP"
+
+STATE_FILE = "bot_state.csv"
+ACTIVITY_FILE = "bot_activity.csv"
+
+NEWS_FILTER_ENABLED = True
+NEWS_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_BLACKOUT_MINUTES_BEFORE = 30
+NEWS_BLACKOUT_MINUTES_AFTER = 30
+NEWS_CURRENCIES = ["USD"]
+NEWS_IMPACT_LEVELS = ["High"]
+
+OANDA_HOSTS = {
+    True: "https://api-fxpractice.oanda.com",
+    False: "https://api-fxtrade.oanda.com",
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# OANDA API HELPERS
+# ══════════════════════════════════════════════════════════════════════════
 
 def oanda_session():
     s = requests.Session()
@@ -81,336 +67,378 @@ def oanda_session():
     return s
 
 
+def oanda_base_url():
+    return OANDA_HOSTS[USE_DEMO_ACCOUNT]
+
+
 def oanda_request(session, method, path, **kwargs):
-    url = f"{BASE_URL}{path}"
-    resp = session.request(method, url, timeout=15, **kwargs)
-    if resp.status_code == 429:
-        time.sleep(5)
-        resp = session.request(method, url, timeout=15, **kwargs)
+    url = f"{oanda_base_url()}{path}"
+    resp = session.request(method, url, timeout=20, **kwargs)
     resp.raise_for_status()
-    return resp.json() if resp.content else None
+    if resp.text:
+        return resp.json()
+    return {}
 
 
 def get_account_summary(session):
     data = oanda_request(session, "GET", f"/v3/accounts/{OANDA_ACCOUNT_ID}/summary")
-    return data["account"]
+    acc = data["account"]
+    return {
+        "balance": float(acc["balance"]),
+        "nav": float(acc["NAV"]),
+        "unrealized_pl": float(acc.get("unrealizedPL", 0.0)),
+        "margin_available": float(acc.get("marginAvailable", 0.0)),
+    }
 
 
 def get_open_position(session, instrument):
     try:
-        data = oanda_request(session, "GET", f"/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}")
+        data = oanda_request(
+            session, "GET",
+            f"/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}"
+        )
+        pos = data["position"]
+        long_units = float(pos["long"]["units"])
+        short_units = float(pos["short"]["units"])
+        return long_units + short_units
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return 0.0
         raise
-    pos = data.get("position", {})
-    long_units = float(pos.get("long", {}).get("units", 0))
-    short_units = float(pos.get("short", {}).get("units", 0))
-    return long_units + short_units
 
 
 def place_market_order(session, instrument, units, stop_loss_price=None, take_profit_price=None):
     order = {
-        "type": "MARKET",
-        "instrument": instrument,
-        "units": str(int(units)),
-        "timeInForce": "FOK",
-        "positionFill": "DEFAULT",
+        "order": {
+            "type": "MARKET",
+            "instrument": instrument,
+            "units": str(int(units)),
+            "timeInForce": "FOK",
+            "positionFill": "DEFAULT",
+        }
     }
     if stop_loss_price is not None:
-        order["stopLossOnFill"] = {"price": f"{stop_loss_price:.2f}"}
+        order["order"]["stopLossOnFill"] = {"price": f"{stop_loss_price:.2f}"}
     if take_profit_price is not None:
-        order["takeProfitOnFill"] = {"price": f"{take_profit_price:.2f}"}
+        order["order"]["takeProfitOnFill"] = {"price": f"{take_profit_price:.2f}"}
 
-    body = {"order": order}
-    return oanda_request(session, "POST", f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", json=body)
+    return oanda_request(
+        session, "POST",
+        f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders",
+        data=json.dumps(order),
+    )
 
 
-def get_candles(session, instrument=INSTRUMENT, granularity=GRANULARITY, count=CANDLE_COUNT):
+def get_candles(session, instrument, granularity, count):
     params = {"granularity": granularity, "count": count, "price": "M"}
-    data = oanda_request(session, "GET", f"/v3/instruments/{instrument}/candles", params=params)
+    data = oanda_request(
+        session, "GET",
+        f"/v3/instruments/{instrument}/candles",
+        params=params,
+    )
     rows = []
     for c in data["candles"]:
-        if not c.get("complete", False):
+        if not c["complete"]:
             continue
-        mid = c["mid"]
         rows.append({
             "time": c["time"],
-            "Open": float(mid["o"]),
-            "High": float(mid["h"]),
-            "Low": float(mid["l"]),
-            "Close": float(mid["c"]),
-            "Volume": int(c.get("volume", 0)),
+            "open": float(c["mid"]["o"]),
+            "high": float(c["mid"]["h"]),
+            "low": float(c["mid"]["l"]),
+            "close": float(c["mid"]["c"]),
+            "volume": int(c["volume"]),
         })
-    df = pd.DataFrame(rows).set_index("time")
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"])
     return df
 
 
-# ---------------- Indicators, patterns, ICT structure ----------------
+# ══════════════════════════════════════════════════════════════════════════
+# INDICATORS
+# ══════════════════════════════════════════════════════════════════════════
 
 def add_indicators(df):
-    delta = df["Close"].diff()
+    delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = (100 - (100 / (1 + rs))).fillna(50)
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(50)
 
-    ema_fast = df["Close"].ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow = df["Close"].ewm(span=MACD_SLOW, adjust=False).mean()
-    df["MACD"] = ema_fast - ema_slow
-    df["MACD_signal"] = df["MACD"].ewm(span=MACD_SIGNAL, adjust=False).mean()
-    df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     return df
 
 
-def add_candle_patterns(df):
-    body = (df["Close"] - df["Open"]).abs()
-    rng = (df["High"] - df["Low"]).replace(0, 1e-9)
-    lower_wick = df[["Open", "Close"]].min(axis=1) - df["Low"]
-    upper_wick = df["High"] - df[["Open", "Close"]].max(axis=1)
-
-    prev_open, prev_close = df["Open"].shift(1), df["Close"].shift(1)
-    df["pat_bull_engulf"] = (prev_close < prev_open) & (df["Close"] > df["Open"]) & \
-                             (df["Open"] <= prev_close) & (df["Close"] >= prev_open)
-    df["pat_bear_engulf"] = (prev_close > prev_open) & (df["Close"] < df["Open"]) & \
-                             (df["Open"] >= prev_close) & (df["Close"] <= prev_open)
-    df["pat_hammer"] = (body <= 0.35*rng) & (lower_wick >= 2*body.replace(0, 1e-9)) & (upper_wick <= 0.15*rng)
-    df["pat_shooting_star"] = (body <= 0.35*rng) & (upper_wick >= 2*body.replace(0, 1e-9)) & (lower_wick <= 0.15*rng)
+def add_bollinger_bands(df, period=20, std_mult=2):
+    mid = df["close"].rolling(period).mean()
+    std = df["close"].rolling(period).std()
+    df["bb_mid"] = mid
+    df["bb_upper"] = mid + std_mult * std
+    df["bb_lower"] = mid - std_mult * std
     return df
 
 
-def add_bollinger_bands(df):
-    mid = df["Close"].rolling(BB_PERIOD).mean()
-    std = df["Close"].rolling(BB_PERIOD).std()
-    df["BB_mid"] = mid
-    df["BB_upper"] = mid + BB_STD_DEV * std
-    df["BB_lower"] = mid - BB_STD_DEV * std
-    band_range = (df["BB_upper"] - df["BB_lower"]).replace(0, np.nan)
-    df["BB_percent_b"] = (df["Close"] - df["BB_lower"]) / band_range
+def add_atr(df, period=14):
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1 / period, min_periods=period).mean()
     return df
 
 
-def add_atr(df):
-    prev_close = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(ATR_PERIOD).mean()
-    df["ATR_pct"] = df["ATR"] / df["Close"] * 100
+def add_volume_signal(df, period=20):
+    avg_vol = df["volume"].rolling(period).mean()
+    df["vol_ratio"] = df["volume"] / avg_vol.replace(0, np.nan)
+    df["vol_spike"] = df["vol_ratio"] > 1.5
     return df
 
 
-def add_volume_signal(df):
-    avg_volume = df["Volume"].rolling(20).mean()
-    df["volume_spike"] = df["Volume"] > (avg_volume * VOLUME_SPIKE_MULT)
+def add_fibonacci_signal(df, lookback=50):
+    roll_high = df["high"].rolling(lookback).max()
+    roll_low = df["low"].rolling(lookback).min()
+    rng = (roll_high - roll_low).replace(0, np.nan)
+    fib_618 = roll_low + 0.618 * rng
+    fib_50 = roll_low + 0.5 * rng
+    df["near_fib_618"] = (df["close"] - fib_618).abs() / rng < 0.01
+    df["near_fib_50"] = (df["close"] - fib_50).abs() / rng < 0.01
     return df
 
 
-def add_fibonacci_signal(df):
-    swing_high = df["High"].rolling(FIB_LOOKBACK).max()
-    swing_low = df["Low"].rolling(FIB_LOOKBACK).min()
-    diff = swing_high - swing_low
+def add_ict_signals(df):
+    prev_low = df["low"].shift(1)
+    prev_high = df["high"].shift(1)
+    df["liquidity_sweep_low"] = (df["low"] < prev_low) & (df["close"] > prev_low)
+    df["liquidity_sweep_high"] = (df["high"] > prev_high) & (df["close"] < prev_high)
 
-    fib_382 = swing_high - 0.382 * diff
-    fib_500 = swing_high - 0.5 * diff
-    fib_618 = swing_high - 0.618 * diff
-
-    def near(level):
-        return (df["Close"] - level).abs() / df["Close"] * 100 <= FIB_TOLERANCE_PCT
-
-    df["near_fib_382"] = near(fib_382)
-    df["near_fib_500"] = near(fib_500)
-    df["near_fib_618"] = near(fib_618)
-    return df
-
-
-def add_ict_signals(df, lookback=20):
-    recent_low = df["Low"].rolling(lookback).min().shift(1)
-    recent_high = df["High"].rolling(lookback).max().shift(1)
-    df["bullish_sweep"] = (df["Low"] < recent_low) & (df["Close"] > recent_low)
-    df["bearish_sweep"] = (df["High"] > recent_high) & (df["Close"] < recent_high)
-
-    next_close = df["Close"].shift(-1)
-    move_pct = (next_close - df["Close"]) / df["Close"] * 100
-    df["bull_order_block"] = (df["Close"] < df["Open"]) & (move_pct >= 0.5)
-    df["bear_order_block"] = (df["Close"] > df["Open"]) & (move_pct <= -0.5)
+    bull_ob = (df["close"].shift(1) < df["open"].shift(1)) & (df["close"] > df["high"].shift(1))
+    bear_ob = (df["close"].shift(1) > df["open"].shift(1)) & (df["close"] < df["low"].shift(1))
+    df["order_block_bull"] = bull_ob
+    df["order_block_bear"] = bear_ob
     return df
 
 
 def add_adx(df, period=14):
-    """Average Directional Index + directional indicators (+DI/-DI), Wilder's method."""
-    up_move = df["High"].diff()
-    down_move = -df["Low"].diff()
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    prev_close = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
 
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan)
-    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
-    adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    atr_w = tr.ewm(alpha=1 / period, min_periods=period).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, min_periods=period).mean() / atr_w.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, min_periods=period).mean() / atr_w.replace(0, np.nan)
 
-    df["plus_DI"] = plus_di
-    df["minus_DI"] = minus_di
-    df["ADX"] = adx.fillna(0)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    df["adx"] = dx.ewm(alpha=1 / period, min_periods=period).mean()
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
     return df
 
 
 def add_stochastic(df, k_period=14, d_period=3):
-    low_min = df["Low"].rolling(k_period).min()
-    high_max = df["High"].rolling(k_period).max()
-    df["stoch_K"] = 100 * (df["Close"] - low_min) / (high_max - low_min).replace(0, np.nan)
-    df["stoch_D"] = df["stoch_K"].rolling(d_period).mean()
+    low_min = df["low"].rolling(k_period).min()
+    high_max = df["high"].rolling(k_period).max()
+    df["stoch_k"] = 100 * (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+    df["stoch_d"] = df["stoch_k"].rolling(d_period).mean()
     return df
 
 
 def add_cci(df, period=20):
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    tp = (df["high"] + df["low"] + df["close"]) / 3
     sma = tp.rolling(period).mean()
-    mad = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-    df["CCI"] = (tp - sma) / (0.015 * mad.replace(0, np.nan))
+    mad = tp.rolling(period).apply(lambda x: (x - x.mean()).abs().mean(), raw=True)
+    df["cci"] = (tp - sma) / (0.015 * mad.replace(0, np.nan))
     return df
 
 
 def add_mfi(df, period=14):
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    money_flow = tp * df["Volume"]
-    positive_flow = np.where(tp > tp.shift(1), money_flow, 0.0)
-    negative_flow = np.where(tp < tp.shift(1), money_flow, 0.0)
-    positive_mf = pd.Series(positive_flow, index=df.index).rolling(period).sum()
-    negative_mf = pd.Series(negative_flow, index=df.index).rolling(period).sum()
-    mfr = positive_mf / negative_mf.replace(0, np.nan)
-    df["MFI"] = (100 - (100 / (1 + mfr))).fillna(50)
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    raw_money_flow = tp * df["volume"]
+    positive_flow = np.where(tp > tp.shift(1), raw_money_flow, 0.0)
+    negative_flow = np.where(tp < tp.shift(1), raw_money_flow, 0.0)
+    pos_sum = pd.Series(positive_flow, index=df.index).rolling(period).sum()
+    neg_sum = pd.Series(negative_flow, index=df.index).rolling(period).sum()
+    money_ratio = pos_sum / neg_sum.replace(0, np.nan)
+    df["mfi"] = 100 - (100 / (1 + money_ratio))
+    df["mfi"] = df["mfi"].fillna(50)
     return df
 
 
-def add_vwap(df):
-    """Rolling VWAP across the pulled candle window (not session-anchored)."""
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    cum_vol = df["Volume"].cumsum().replace(0, np.nan)
-    df["VWAP"] = (tp * df["Volume"]).cumsum() / cum_vol
+def add_vwap(df, period=50):
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    pv = tp * df["volume"]
+    df["vwap"] = pv.rolling(period).sum() / df["volume"].rolling(period).sum().replace(0, np.nan)
     return df
 
 
-def get_htf_bias(session):
-    """
-    Real multi-timeframe trend check using OANDA's own daily/4H/1H candles.
-    Returns 1 (all bullish), -1 (all bearish), or 0 (mixed / unavailable).
-    """
+def get_htf_bias(session, instrument):
+    bias = 0
     try:
-        d1 = get_candles(session, granularity="D", count=60)
-        h4 = get_candles(session, granularity="H4", count=60)
-        h1 = get_candles(session, granularity="H1", count=60)
+        for gran, weight in [("D", 1), ("H4", 1), ("H1", 1)]:
+            df = get_candles(session, instrument, gran, 60)
+            if len(df) < 20:
+                continue
+            ema20 = df["close"].ewm(span=20, adjust=False).mean()
+            if df["close"].iloc[-1] > ema20.iloc[-1]:
+                bias += weight
+            else:
+                bias -= weight
     except Exception:
         return 0
-
-    def is_bull(df):
-        if len(df) < 21:
-            return None
-        ema20 = df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
-        return df["Close"].iloc[-1] > ema20
-
-    votes = [v for v in [is_bull(d1), is_bull(h4), is_bull(h1)] if v is not None]
-    if not votes:
-        return 0
-    if all(votes):
-        return 1
-    if not any(votes):
-        return -1
-    return 0
+    return bias
 
 
-def in_active_session(timestamp_str):
-    """True during London or New York trading hours (UTC) - a soft confidence
-    signal, not a hard filter, so it doesn't cut down on scalping frequency."""
-    try:
-        hour = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00")).hour
-    except Exception:
-        return False
+def in_active_session():
+    now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
     london = 7 <= hour <= 16
     ny = 12 <= hour <= 21
     return london or ny
 
 
+def fetch_news_events():
+    if not NEWS_FILTER_ENABLED:
+        return []
+    try:
+        resp = requests.get(NEWS_CALENDAR_URL, timeout=10)
+        resp.raise_for_status()
+        events = resp.json()
+        filtered = []
+        for ev in events:
+            if ev.get("country") not in NEWS_CURRENCIES:
+                continue
+            if ev.get("impact") not in NEWS_IMPACT_LEVELS:
+                continue
+            try:
+                ev_time = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+            except Exception:
+                continue
+            filtered.append({"time": ev_time, "title": ev.get("title", "")})
+        return filtered
+    except Exception:
+        return []
+
+
+def in_news_blackout(news_events):
+    now_utc = datetime.now(timezone.utc)
+    for ev in news_events:
+        window_start = ev["time"] - timedelta(minutes=NEWS_BLACKOUT_MINUTES_BEFORE)
+        window_end = ev["time"] + timedelta(minutes=NEWS_BLACKOUT_MINUTES_AFTER)
+        if window_start <= now_utc <= window_end:
+            return True, ev
+    return False, None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SCORING
+# ══════════════════════════════════════════════════════════════════════════
+
 def score_row(row, htf_bias=0, in_session=False):
     score = 0
-    if row["RSI"] < RSI_OVERSOLD: score += 1
-    elif row["RSI"] > RSI_OVERBOUGHT: score -= 1
-    if row["MACD"] > row["MACD_signal"] and row["MACD_hist"] > 0: score += 1
-    elif row["MACD"] < row["MACD_signal"] and row["MACD_hist"] < 0: score -= 1
-    if row.get("pat_bull_engulf") or row.get("pat_hammer"): score += 1
-    if row.get("pat_bear_engulf") or row.get("pat_shooting_star"): score -= 1
-    if row.get("bullish_sweep"): score += 1
-    if row.get("bearish_sweep"): score -= 1
-    if row.get("bull_order_block"): score += 1
-    if row.get("bear_order_block"): score -= 1
 
-    bb = row.get("BB_percent_b")
-    if bb is not None and not pd.isna(bb):
-        if bb <= 0: score += 1
-        elif bb >= 1: score -= 1
+    if row["close"] > row["ema20"]:
+        score += 1
+    else:
+        score -= 1
 
-    adx_val = row.get("ADX")
-    if adx_val is not None and not pd.isna(adx_val) and adx_val > 20:
-        if row.get("plus_DI", 0) > row.get("minus_DI", 0): score += 1
-        else: score -= 1
+    if row["macd_hist"] > 0:
+        score += 1
+    else:
+        score -= 1
 
-    stoch_k, stoch_d = row.get("stoch_K"), row.get("stoch_D")
-    if stoch_k is not None and stoch_d is not None and not pd.isna(stoch_k) and not pd.isna(stoch_d):
-        if stoch_k > stoch_d: score += 1
-        else: score -= 1
+    if row["rsi"] < 30:
+        score += 1
+    elif row["rsi"] > 70:
+        score -= 1
 
-    cci_val = row.get("CCI")
-    if cci_val is not None and not pd.isna(cci_val):
-        if cci_val > 0: score += 1
-        else: score -= 1
+    if not pd.isna(row.get("bb_lower", np.nan)) and row["close"] < row["bb_lower"]:
+        score += 1
+    if not pd.isna(row.get("bb_upper", np.nan)) and row["close"] > row["bb_upper"]:
+        score -= 1
 
-    mfi_val = row.get("MFI")
-    if mfi_val is not None and not pd.isna(mfi_val):
-        if mfi_val > 50: score += 1
-        else: score -= 1
+    if not pd.isna(row.get("adx", np.nan)) and row["adx"] > 20:
+        if row.get("plus_di", 0) > row.get("minus_di", 0):
+            score += 1
+        else:
+            score -= 1
 
-    vwap_val = row.get("VWAP")
-    if vwap_val is not None and not pd.isna(vwap_val):
-        if row["Close"] > vwap_val: score += 1
-        else: score -= 1
+    if not pd.isna(row.get("stoch_k", np.nan)):
+        if row["stoch_k"] < 20 and row["stoch_k"] > row.get("stoch_d", 0):
+            score += 1
+        elif row["stoch_k"] > 80 and row["stoch_k"] < row.get("stoch_d", 100):
+            score -= 1
 
-    if htf_bias == 1: score += 1
-    elif htf_bias == -1: score -= 1
+    if not pd.isna(row.get("cci", np.nan)):
+        if row["cci"] < -100:
+            score += 1
+        elif row["cci"] > 100:
+            score -= 1
 
-    if row.get("volume_spike"):
-        if score > 0: score += 1
-        elif score < 0: score -= 1
+    if not pd.isna(row.get("mfi", np.nan)):
+        if row["mfi"] < 20:
+            score += 1
+        elif row["mfi"] > 80:
+            score -= 1
 
-    if row.get("near_fib_382") or row.get("near_fib_500") or row.get("near_fib_618"):
-        if score > 0: score += 1
-        elif score < 0: score -= 1
+    if not pd.isna(row.get("vwap", np.nan)):
+        if row["close"] > row["vwap"]:
+            score += 1
+        else:
+            score -= 1
+
+    if row.get("liquidity_sweep_low", False) or row.get("order_block_bull", False):
+        score += 1
+    if row.get("liquidity_sweep_high", False) or row.get("order_block_bear", False):
+        score -= 1
+
+    if row.get("near_fib_618", False) or row.get("near_fib_50", False):
+        if score > 0:
+            score += 1
+        elif score < 0:
+            score -= 1
+
+    if row.get("vol_spike", False):
+        if score > 0:
+            score += 1
+        elif score < 0:
+            score -= 1
+
+    if htf_bias > 0 and score > 0:
+        score += 1
+    elif htf_bias < 0 and score < 0:
+        score -= 1
 
     if in_session:
-        if score > 0: score += 1
-        elif score < 0: score -= 1
+        if score > 0:
+            score += 1
+        elif score < 0:
+            score -= 1
 
-    atr_pct = row.get("ATR_pct")
-    if atr_pct is not None and not pd.isna(atr_pct) and atr_pct < 0.02:
-        score = 0
+    if not pd.isna(row.get("atr", np.nan)) and not pd.isna(row.get("close", np.nan)):
+        atr_pct = row["atr"] / row["close"] * 100
+        if atr_pct < 0.02:
+            score = 0
 
     return score
 
 
 def latest_decision(df, htf_bias=0):
     df = add_indicators(df)
-    df = add_candle_patterns(df)
     df = add_bollinger_bands(df)
     df = add_atr(df)
     df = add_volume_signal(df)
@@ -421,154 +449,194 @@ def latest_decision(df, htf_bias=0):
     df = add_cci(df)
     df = add_mfi(df)
     df = add_vwap(df)
-    df = df.dropna(subset=["RSI", "MACD", "MACD_signal", "BB_percent_b", "ATR_pct"])
-    if df.empty:
-        return "hold", 0, None
+
+    session_active = in_active_session()
     last_row = df.iloc[-1]
-    session_active = in_active_session(str(last_row.name))
     score = score_row(last_row, htf_bias=htf_bias, in_session=session_active)
+
     if score >= BUY_SCORE_THRESHOLD:
         decision = "buy"
     elif score <= SELL_SCORE_THRESHOLD:
         decision = "sell"
     else:
-        decision = "hold"
-    return decision, score, last_row
+        decision = "none"
 
+    return {
+        "decision": decision,
+        "score": score,
+        "price": float(last_row["close"]),
+        "atr": float(last_row["atr"]) if not pd.isna(last_row.get("atr", np.nan)) else None,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STATE / RISK MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"date": str(date.today()), "trades_today": 0, "last_trade_time": 0,
-                "starting_equity_today": None}
-    with open(STATE_FILE) as f:
-        reader = csv.DictReader(f)
-        row = next(reader, None)
-    if not row:
-        return {"date": str(date.today()), "trades_today": 0, "last_trade_time": 0,
-                "starting_equity_today": None}
-    state = {
-        "date": row["date"],
-        "trades_today": int(row["trades_today"]),
-        "last_trade_time": float(row["last_trade_time"]),
-        "starting_equity_today": float(row["starting_equity_today"]) if row["starting_equity_today"] else None,
+    default = {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "trades_today": 0,
+        "start_of_day_equity": None,
+        "last_trade_time": None,
     }
-    if state["date"] != str(date.today()):
-        state = {"date": str(date.today()), "trades_today": 0, "last_trade_time": 0,
-                  "starting_equity_today": None}
-    return state
+    if not os.path.exists(STATE_FILE):
+        return default
+    with open(STATE_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        if not rows:
+            return default
+        row = rows[-1]
+        return {
+            "date": row["date"],
+            "trades_today": int(row["trades_today"]),
+            "start_of_day_equity": float(row["start_of_day_equity"]) if row["start_of_day_equity"] else None,
+            "last_trade_time": row["last_trade_time"] if row["last_trade_time"] else None,
+        }
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "trades_today", "last_trade_time", "starting_equity_today"])
-        writer.writeheader()
+    file_exists = os.path.exists(STATE_FILE)
+    with open(STATE_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["date", "trades_today", "start_of_day_equity", "last_trade_time"])
+        if not file_exists:
+            writer.writeheader()
         writer.writerow(state)
 
 
 def approve_trade(state, equity):
-    if state["starting_equity_today"] is None:
-        state["starting_equity_today"] = equity
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if state["date"] != today:
+        state = {
+            "date": today,
+            "trades_today": 0,
+            "start_of_day_equity": equity,
+            "last_trade_time": None,
+        }
+
+    if state["start_of_day_equity"] is None:
+        state["start_of_day_equity"] = equity
 
     if os.path.exists(KILL_SWITCH_FILE):
-        return False, "Kill switch active"
-    if (time.time() - state["last_trade_time"]) < COOLDOWN_SECONDS_AFTER_TRADE:
-        return False, "In cooldown"
+        return False, state, "kill switch active"
+
     if state["trades_today"] >= MAX_TRADES_PER_DAY:
-        return False, "Max trades/day reached"
-    if state["starting_equity_today"] > 0:
-        drawdown = (state["starting_equity_today"] - equity) / state["starting_equity_today"]
-        if drawdown >= DAILY_LOSS_LIMIT_FRACTION:
-            return False, "Daily loss limit reached"
-    return True, "OK"
+        return False, state, "daily trade limit reached"
+
+    if state["last_trade_time"]:
+        last_time = datetime.fromisoformat(state["last_trade_time"])
+        elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
+        if elapsed < COOLDOWN_SECONDS_AFTER_TRADE:
+            return False, state, "cooldown active"
+
+    daily_loss = state["start_of_day_equity"] - equity
+    if daily_loss > state["start_of_day_equity"] * DAILY_LOSS_LIMIT_FRACTION:
+        return False, state, "daily loss limit reached"
+
+    return True, state, "ok"
 
 
-def log_row(row):
-    exists = os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not exists:
+def log_row(row_dict):
+    file_exists = os.path.exists(ACTIVITY_FILE)
+    with open(ACTIVITY_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
+        if not file_exists:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(row_dict)
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════
 
 def main():
-    ts = datetime.utcnow().isoformat()
-
     if not OANDA_API_TOKEN or not OANDA_ACCOUNT_ID:
-        print("ERROR: OANDA_API_TOKEN / OANDA_ACCOUNT_ID not set. Check GitHub Secrets.")
-        return
+        print("Missing OANDA_API_TOKEN or OANDA_ACCOUNT_ID environment variables.")
+        sys.exit(1)
 
     session = oanda_session()
+
+    account = get_account_summary(session)
+    equity = account["nav"]
+
+    df = get_candles(session, INSTRUMENT, GRANULARITY, CANDLE_COUNT)
+    if len(df) < 60:
+        print("Not enough candle data yet.")
+        return
+
+    htf_bias = get_htf_bias(session, INSTRUMENT)
+    result = latest_decision(df, htf_bias=htf_bias)
+
+    decision = result["decision"]
+    score = result["score"]
+    price = result["price"]
+
     state = load_state()
+    current_position = get_open_position(session, INSTRUMENT)
 
-    try:
-        df = get_candles(session)
-        htf_bias = get_htf_bias(session)
-        decision, score, last_row = latest_decision(df, htf_bias=htf_bias)
+    news_events = fetch_news_events()
+    blackout_active, blackout_event = in_news_blackout(news_events)
 
-        account = get_account_summary(session)
-        equity = float(account["NAV"])
+    action = "none"
+    reason = ""
+    units_placed = 0
 
-        approved, reason = approve_trade(state, equity)
+    if decision == "none":
+        reason = "no signal"
+    elif blackout_active:
+        reason = f"news blackout: {blackout_event['title']}"
+    elif decision == "sell" and not ALLOW_SHORTING:
+        reason = "shorting disabled"
+    else:
+        approved, state, approve_reason = approve_trade(state, equity)
+        if not approved:
+            reason = approve_reason
+        else:
+            stop_distance = price * STOP_LOSS_PCT / 100
+            risk_amount = equity * MAX_POSITION_FRACTION
+            units = int(risk_amount / stop_distance) if stop_distance > 0 else 0
 
-        action = "none"
-        if decision in ("buy", "sell") and approved:
-            price = float(last_row["Close"])
-            current_position = get_open_position(session, INSTRUMENT)
-            units = 0
-            stop_loss_price = None
-            take_profit_price = None
-
-            if decision == "buy":
-                if current_position > 0:
-                    action = "skipped (already long)"
-                elif current_position < 0:
-                    units = abs(current_position)
-                    action_label = "close short"
-                else:
-                    cash_to_risk = equity * MAX_POSITION_FRACTION
-                    units = int(cash_to_risk // price)
-                    stop_loss_price = price * (1 - STOP_LOSS_PCT / 100)
-                    take_profit_price = price * (1 + TAKE_PROFIT_PCT / 100)
-                    action_label = "buy"
-
+            if units <= 0:
+                reason = "computed 0 units (risk_amount too small vs stop_distance)"
+            elif decision == "buy" and current_position <= 0:
+                sl_price = price * (1 - STOP_LOSS_PCT / 100)
+                tp_price = price * (1 + TAKE_PROFIT_PCT / 100)
+                place_market_order(session, INSTRUMENT, units, sl_price, tp_price)
+                action = "buy"
+                units_placed = units
+                reason = "buy order placed"
+            elif decision == "sell" and current_position >= 0:
+                sl_price = price * (1 + STOP_LOSS_PCT / 100)
+                tp_price = price * (1 - TAKE_PROFIT_PCT / 100)
+                place_market_order(session, INSTRUMENT, -units, sl_price, tp_price)
+                action = "sell"
+                units_placed = -units
+                reason = "sell order placed"
             else:
-                if current_position < 0:
-                    action = "skipped (already short)"
-                elif current_position > 0:
-                    units = -abs(current_position)
-                    action_label = "close long"
-                elif ALLOW_SHORTING:
-                    cash_to_risk = equity * MAX_POSITION_FRACTION
-                    units = -int(cash_to_risk // price)
-                    stop_loss_price = price * (1 + STOP_LOSS_PCT / 100)
-                    take_profit_price = price * (1 - TAKE_PROFIT_PCT / 100)
-                    action_label = "open short"
-                else:
-                    action = "skipped (nothing to sell, shorting disabled)"
+                reason = "already in matching position"
 
-            if units != 0:
-                place_market_order(session, INSTRUMENT, units,
-                                    stop_loss_price=stop_loss_price,
-                                    take_profit_price=take_profit_price)
+            if action != "none":
                 state["trades_today"] += 1
-                state["last_trade_time"] = time.time()
-                action = f"{action_label} units={units}"
-                if stop_loss_price:
-                    action += f" SL={stop_loss_price:.2f} TP={take_profit_price:.2f}"
-
-        elif decision in ("buy", "sell") and not approved:
-            action = f"blocked: {reason}"
-
-        log_row({"timestamp": ts, "decision": decision, "score": score,
-                  "equity": equity, "action": action})
-        print(f"[{ts}] decision={decision} score={score} equity={equity:.2f} action={action}")
-
-    except Exception as e:
-        log_row({"timestamp": ts, "decision": "error", "score": "", "equity": "", "action": str(e)})
-        print(f"[{ts}] ERROR: {e}")
+                state["last_trade_time"] = datetime.now(timezone.utc).isoformat()
 
     save_state(state)
+
+    log_row({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "price": price,
+        "score": score,
+        "decision": decision,
+        "action": action,
+        "units": units_placed,
+        "equity": equity,
+        "position": current_position,
+        "htf_bias": htf_bias,
+        "reason": reason,
+    })
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] price={price} score={score} decision={decision} action={action} units={units_placed} reason={reason}")
 
 
 if __name__ == "__main__":
