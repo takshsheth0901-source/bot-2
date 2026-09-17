@@ -482,18 +482,27 @@ def load_state():
     }
     if not os.path.exists(STATE_FILE):
         return default
-    with open(STATE_FILE, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        if not rows:
-            return default
-        row = rows[-1]
-        return {
-            "date": row["date"],
-            "trades_today": int(row["trades_today"]),
-            "start_of_day_equity": float(row["start_of_day_equity"]) if row["start_of_day_equity"] else None,
-            "last_trade_time": row["last_trade_time"] if row["last_trade_time"] else None,
-        }
+    try:
+        with open(STATE_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            if not rows:
+                return default
+            row = rows[-1]
+            date_val = row.get("date")
+            trades_val = row.get("trades_today")
+            equity_val = row.get("start_of_day_equity")
+            last_trade_val = row.get("last_trade_time")
+            if not date_val or trades_val is None:
+                return default
+            return {
+                "date": date_val,
+                "trades_today": int(trades_val),
+                "start_of_day_equity": float(equity_val) if equity_val else None,
+                "last_trade_time": last_trade_val if last_trade_val else None,
+            }
+    except Exception:
+        return default
 
 
 def save_state(state):
