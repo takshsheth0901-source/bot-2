@@ -1,5 +1,5 @@
 """
-Automated Gold (XAU/USD) trading bot for OANDA.
+Automated multi-pair trading bot for OANDA (Gold + EUR/USD + GBP/USD).
 Runs once per invocation — intended to be triggered every 5 minutes by GitHub Actions.
 """
 
@@ -22,7 +22,7 @@ USE_DEMO_ACCOUNT = True
 OANDA_API_TOKEN = os.environ.get("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 
-INSTRUMENT = "XAU_USD"
+INSTRUMENTS = ["XAU_USD", "EUR_USD", "GBP_USD"]
 GRANULARITY = "M1"
 CANDLE_COUNT = 300
 
@@ -35,7 +35,7 @@ SELL_SCORE_THRESHOLD = -1
 
 MAX_TRADES_PER_DAY = 30
 MAX_POSITION_FRACTION = 0.05
-DAILY_LOSS_LIMIT_FRACTION = 0.03
+DAILY_LOSS_LIMIT_FRACTION = 0.10       # shared across all instruments (£100 on a £1000 account)
 COOLDOWN_SECONDS_AFTER_TRADE = 120
 KILL_SWITCH_FILE = "STOP"
 
@@ -107,7 +107,7 @@ def get_open_position(session, instrument):
         raise
 
 
-def place_market_order(session, instrument, units, stop_loss_price=None, take_profit_price=None):
+def place_market_order(session, instrument, units, stop_loss_price=None, take_profit_price=None, price_precision=2):
     order = {
         "order": {
             "type": "MARKET",
@@ -118,9 +118,9 @@ def place_market_order(session, instrument, units, stop_loss_price=None, take_pr
         }
     }
     if stop_loss_price is not None:
-        order["order"]["stopLossOnFill"] = {"price": f"{stop_loss_price:.2f}"}
+        order["order"]["stopLossOnFill"] = {"price": f"{stop_loss_price:.{price_precision}f}"}
     if take_profit_price is not None:
-        order["order"]["takeProfitOnFill"] = {"price": f"{take_profit_price:.2f}"}
+        order["order"]["takeProfitOnFill"] = {"price": f"{take_profit_price:.{price_precision}f}"}
 
     return oanda_request(
         session, "POST",
@@ -129,20 +129,26 @@ def place_market_order(session, instrument, units, stop_loss_price=None, take_pr
     )
 
 
-def get_instrument_margin_rate(session, instrument):
-    """Returns the margin rate (e.g. 0.05 = 5%, meaning 20:1 leverage) for the instrument."""
+def get_instruments_details(session, instruments):
+    """Returns {instrument: {marginRate: float, displayPrecision: int}} for all requested instruments in one call."""
+    details = {}
     try:
         data = oanda_request(
             session, "GET",
             f"/v3/accounts/{OANDA_ACCOUNT_ID}/instruments",
-            params={"instruments": instrument},
+            params={"instruments": ",".join(instruments)},
         )
-        instruments = data.get("instruments", [])
-        if instruments:
-            return float(instruments[0]["marginRate"])
+        for inst in data.get("instruments", []):
+            details[inst["name"]] = {
+                "marginRate": float(inst.get("marginRate", 0.05)),
+                "displayPrecision": int(inst.get("displayPrecision", 5)),
+            }
     except Exception:
         pass
-    return 0.05  # safe fallback assumption: 5% margin (20:1 leverage)
+    for instrument in instruments:
+        if instrument not in details:
+            details[instrument] = {"marginRate": 0.05, "displayPrecision": 5}
+    return details
 
 
 def get_candles(session, instrument, granularity, count):
@@ -494,7 +500,7 @@ def load_state():
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "trades_today": 0,
         "start_of_day_equity": None,
-        "last_trade_time": None,
+        "last_trade_time_by_instrument": {},
     }
     if not os.path.exists(STATE_FILE):
         return default
@@ -508,14 +514,18 @@ def load_state():
             date_val = row.get("date")
             trades_val = row.get("trades_today")
             equity_val = row.get("start_of_day_equity")
-            last_trade_val = row.get("last_trade_time")
+            last_trade_json = row.get("last_trade_time_by_instrument")
             if not date_val or trades_val is None:
                 return default
+            try:
+                last_trade_dict = json.loads(last_trade_json) if last_trade_json else {}
+            except Exception:
+                last_trade_dict = {}
             return {
                 "date": date_val,
                 "trades_today": int(trades_val),
                 "start_of_day_equity": float(equity_val) if equity_val else None,
-                "last_trade_time": last_trade_val if last_trade_val else None,
+                "last_trade_time_by_instrument": last_trade_dict,
             }
     except Exception:
         return default
@@ -524,13 +534,18 @@ def load_state():
 def save_state(state):
     file_exists = os.path.exists(STATE_FILE)
     with open(STATE_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "trades_today", "start_of_day_equity", "last_trade_time"])
+        writer = csv.DictWriter(f, fieldnames=["date", "trades_today", "start_of_day_equity", "last_trade_time_by_instrument"])
         if not file_exists:
             writer.writeheader()
-        writer.writerow(state)
+        writer.writerow({
+            "date": state["date"],
+            "trades_today": state["trades_today"],
+            "start_of_day_equity": state["start_of_day_equity"],
+            "last_trade_time_by_instrument": json.dumps(state["last_trade_time_by_instrument"]),
+        })
 
 
-def approve_trade(state, equity):
+def approve_trade(state, equity, instrument):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     if state["date"] != today:
@@ -538,7 +553,7 @@ def approve_trade(state, equity):
             "date": today,
             "trades_today": 0,
             "start_of_day_equity": equity,
-            "last_trade_time": None,
+            "last_trade_time_by_instrument": {},
         }
 
     if state["start_of_day_equity"] is None:
@@ -550,11 +565,12 @@ def approve_trade(state, equity):
     if state["trades_today"] >= MAX_TRADES_PER_DAY:
         return False, state, "daily trade limit reached"
 
-    if state["last_trade_time"]:
-        last_time = datetime.fromisoformat(state["last_trade_time"])
+    last_trade_iso = state["last_trade_time_by_instrument"].get(instrument)
+    if last_trade_iso:
+        last_time = datetime.fromisoformat(last_trade_iso)
         elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
         if elapsed < COOLDOWN_SECONDS_AFTER_TRADE:
-            return False, state, "cooldown active"
+            return False, state, "cooldown active for this pair"
 
     daily_loss = state["start_of_day_equity"] - equity
     if daily_loss > state["start_of_day_equity"] * DAILY_LOSS_LIMIT_FRACTION:
@@ -573,41 +589,47 @@ def log_row(row_dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MAIN
+# PER-INSTRUMENT PROCESSING
 # ══════════════════════════════════════════════════════════════════════════
 
-def main():
-    if not OANDA_API_TOKEN or not OANDA_ACCOUNT_ID:
-        print("Missing OANDA_API_TOKEN or OANDA_ACCOUNT_ID environment variables.")
-        sys.exit(1)
-
-    session = oanda_session()
-
+def process_instrument(session, instrument, instrument_details, state, news_events):
     account = get_account_summary(session)
     equity = account["nav"]
     margin_available = account["margin_available"]
 
-    df = get_candles(session, INSTRUMENT, GRANULARITY, CANDLE_COUNT)
+    df = get_candles(session, instrument, GRANULARITY, CANDLE_COUNT)
     if len(df) < 60:
-        print("Not enough candle data yet.")
-        return
+        log_row({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instrument": instrument,
+            "price": None,
+            "score": None,
+            "decision": "none",
+            "action": "none",
+            "units": 0,
+            "equity": equity,
+            "position": None,
+            "htf_bias": None,
+            "reason": "not enough candle data yet",
+        })
+        return state
 
-    htf_bias = get_htf_bias(session, INSTRUMENT)
+    htf_bias = get_htf_bias(session, instrument)
     result = latest_decision(df, htf_bias=htf_bias)
 
     decision = result["decision"]
     score = result["score"]
     price = result["price"]
 
-    state = load_state()
-    current_position = get_open_position(session, INSTRUMENT)
-
-    news_events = fetch_news_events()
+    current_position = get_open_position(session, instrument)
     blackout_active, blackout_event = in_news_blackout(news_events)
 
     action = "none"
     reason = ""
     units_placed = 0
+
+    margin_rate = instrument_details.get(instrument, {}).get("marginRate", 0.05)
+    price_precision = instrument_details.get(instrument, {}).get("displayPrecision", 5)
 
     if decision == "none":
         reason = "no signal"
@@ -616,7 +638,7 @@ def main():
     elif decision == "sell" and not ALLOW_SHORTING:
         reason = "shorting disabled"
     else:
-        approved, state, approve_reason = approve_trade(state, equity)
+        approved, state, approve_reason = approve_trade(state, equity, instrument)
         if not approved:
             reason = approve_reason
         else:
@@ -624,7 +646,6 @@ def main():
             risk_amount = equity * MAX_POSITION_FRACTION
             risk_based_units = int(risk_amount / stop_distance) if stop_distance > 0 else 0
 
-            margin_rate = get_instrument_margin_rate(session, INSTRUMENT)
             margin_safety_buffer = 0.9
             margin_based_units = int((margin_available * margin_safety_buffer) / (price * margin_rate)) if price > 0 and margin_rate > 0 else 0
 
@@ -639,7 +660,7 @@ def main():
             elif decision == "buy" and current_position <= 0:
                 sl_price = price * (1 - STOP_LOSS_PCT / 100)
                 tp_price = price * (1 + TAKE_PROFIT_PCT / 100)
-                order_response = place_market_order(session, INSTRUMENT, units, sl_price, tp_price)
+                order_response = place_market_order(session, instrument, units, sl_price, tp_price, price_precision)
                 if "orderFillTransaction" in order_response:
                     action = "buy"
                     units_placed = units
@@ -652,7 +673,7 @@ def main():
             elif decision == "sell" and current_position >= 0:
                 sl_price = price * (1 + STOP_LOSS_PCT / 100)
                 tp_price = price * (1 - TAKE_PROFIT_PCT / 100)
-                order_response = place_market_order(session, INSTRUMENT, -units, sl_price, tp_price)
+                order_response = place_market_order(session, instrument, -units, sl_price, tp_price, price_precision)
                 if "orderFillTransaction" in order_response:
                     action = "sell"
                     units_placed = -units
@@ -667,12 +688,11 @@ def main():
 
             if action != "none":
                 state["trades_today"] += 1
-                state["last_trade_time"] = datetime.now(timezone.utc).isoformat()
-
-    save_state(state)
+                state["last_trade_time_by_instrument"][instrument] = datetime.now(timezone.utc).isoformat()
 
     log_row({
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instrument": instrument,
         "price": price,
         "score": score,
         "decision": decision,
@@ -684,7 +704,30 @@ def main():
         "reason": reason,
     })
 
-    print(f"[{datetime.now(timezone.utc).isoformat()}] price={price} score={score} decision={decision} action={action} units={units_placed} reason={reason}")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {instrument} price={price} score={score} decision={decision} action={action} units={units_placed} reason={reason}")
+
+    return state
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════
+
+def main():
+    if not OANDA_API_TOKEN or not OANDA_ACCOUNT_ID:
+        print("Missing OANDA_API_TOKEN or OANDA_ACCOUNT_ID environment variables.")
+        sys.exit(1)
+
+    session = oanda_session()
+
+    instrument_details = get_instruments_details(session, INSTRUMENTS)
+    news_events = fetch_news_events()
+    state = load_state()
+
+    for instrument in INSTRUMENTS:
+        state = process_instrument(session, instrument, instrument_details, state, news_events)
+
+    save_state(state)
 
 
 if __name__ == "__main__":
