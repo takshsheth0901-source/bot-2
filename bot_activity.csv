@@ -511,3 +511,4 @@ timestamp,decision,score,equity,action
 2026-09-17T16:13:51.130755+00:00,4369.54,3,buy,none,0,968.6215,0.0,1,daily loss limit reached
 2026-09-17T16:29:04.389431+00:00,4367.035,-5,sell,none,0,968.6215,0.0,1,daily loss limit reached
 2026-09-17T16:42:30.309434+00:00,4360.24,-4,sell,none,0,968.6215,0.0,1,daily loss limit reached
+2026-09-17T16:53:46.355028+00:00,4359.66,-3,sell,none,0,968.6215,0.0,1,daily loss limit reached
