@@ -612,17 +612,29 @@ def main():
             elif decision == "buy" and current_position <= 0:
                 sl_price = price * (1 - STOP_LOSS_PCT / 100)
                 tp_price = price * (1 + TAKE_PROFIT_PCT / 100)
-                place_market_order(session, INSTRUMENT, units, sl_price, tp_price)
-                action = "buy"
-                units_placed = units
-                reason = "buy order placed"
+                order_response = place_market_order(session, INSTRUMENT, units, sl_price, tp_price)
+                if "orderFillTransaction" in order_response:
+                    action = "buy"
+                    units_placed = units
+                    reason = "buy order FILLED"
+                elif "orderCancelTransaction" in order_response:
+                    cancel_reason = order_response["orderCancelTransaction"].get("reason", "UNKNOWN")
+                    reason = f"buy order REJECTED by OANDA: {cancel_reason}"
+                else:
+                    reason = f"buy order response unclear: {json.dumps(order_response)[:300]}"
             elif decision == "sell" and current_position >= 0:
                 sl_price = price * (1 + STOP_LOSS_PCT / 100)
                 tp_price = price * (1 - TAKE_PROFIT_PCT / 100)
-                place_market_order(session, INSTRUMENT, -units, sl_price, tp_price)
-                action = "sell"
-                units_placed = -units
-                reason = "sell order placed"
+                order_response = place_market_order(session, INSTRUMENT, -units, sl_price, tp_price)
+                if "orderFillTransaction" in order_response:
+                    action = "sell"
+                    units_placed = -units
+                    reason = "sell order FILLED"
+                elif "orderCancelTransaction" in order_response:
+                    cancel_reason = order_response["orderCancelTransaction"].get("reason", "UNKNOWN")
+                    reason = f"sell order REJECTED by OANDA: {cancel_reason}"
+                else:
+                    reason = f"sell order response unclear: {json.dumps(order_response)[:300]}"
             else:
                 reason = "already in matching position"
 
