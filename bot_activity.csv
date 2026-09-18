@@ -707,3 +707,6 @@ timestamp,decision,score,equity,action
 2026-09-18T07:56:11.896079+00:00,XAU_USD,4395.41,0,none,none,0,999.6928,4.0,1,no signal
 2026-09-18T07:56:12.918343+00:00,EUR_USD,1.14873,0,none,none,0,998.9979,0.0,-1,no signal
 2026-09-18T07:56:13.488114+00:00,GBP_USD,1.33706,0,none,none,0,997.4266,0.0,-1,no signal
+2026-09-18T08:09:47.254582+00:00,XAU_USD,4396.39,6,buy,none,0,998.181,4.0,1,already in matching position
+2026-09-18T08:09:48.445639+00:00,EUR_USD,1.14863,0,none,none,0,998.181,0.0,-1,no signal
+2026-09-18T08:09:49.005826+00:00,GBP_USD,1.3369,0,none,none,0,998.1811,0.0,-3,no signal
