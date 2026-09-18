@@ -638,3 +638,6 @@ timestamp,decision,score,equity,action
 2026-09-18T03:04:23.146163+00:00,XAU_USD,4348.39,-3,sell,sell,-2,912.8956,0.0,1,sell order FILLED (margin-capped size)
 2026-09-18T03:04:23.723793+00:00,EUR_USD,1.148,0,none,none,0,911.8373,0.0,-1,no signal
 2026-09-18T03:04:24.245875+00:00,GBP_USD,1.33612,0,none,none,0,911.8524,-6689.0,-3,no signal
+2026-09-18T03:20:22.844483+00:00,XAU_USD,4337.645,-1,sell,none,0,924.5563,-2.0,1,already in matching position
+2026-09-18T03:20:23.300338+00:00,EUR_USD,1.14836,0,none,none,0,923.9192,0.0,-1,no signal
+2026-09-18T03:20:23.643239+00:00,GBP_USD,1.33648,0,none,none,0,923.9637,-6689.0,-3,no signal
