@@ -851,3 +851,6 @@ timestamp,decision,score,equity,action
 2026-09-18T17:49:47.367254+00:00,XAU_USD,4395.74,3,buy,none,0,959.5304,0.0,1,daily trade limit reached
 2026-09-18T17:49:48.029476+00:00,EUR_USD,1.14825,0,none,none,0,959.5304,0.0,-3,no signal
 2026-09-18T17:49:48.292729+00:00,GBP_USD,1.33906,0,none,none,0,959.5304,0.0,-1,no signal
+2026-09-18T17:58:27.107137+00:00,XAU_USD,4393.765,3,buy,none,0,959.5304,0.0,1,daily trade limit reached
+2026-09-18T17:58:27.785621+00:00,EUR_USD,1.14808,0,none,none,0,959.5304,0.0,-3,no signal
+2026-09-18T17:58:28.428687+00:00,GBP_USD,1.33896,0,none,none,0,959.5304,0.0,-1,no signal
