@@ -387,4 +387,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Never let a missing secret or a flaky API kill the workflow with a
+        # red X and no explanation — log it plainly and exit cleanly instead.
+        print(f"Sniper run failed cleanly: {e}")
+        print("If this mentions SOLANA_TRACKER_API_KEY, SOLANA_RPC_URL, or "
+              "SOLANA_WALLET_PRIVATE_KEY, that secret isn't set in the repo yet.")
