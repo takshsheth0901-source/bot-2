@@ -1,6 +1,18 @@
 """
 Automated multi-pair trend-breakout trading bot for OANDA (Gold + EUR/USD + GBP/USD).
 Runs once per invocation — intended to be triggered every 5 minutes by GitHub Actions.
+
+STRATEGY (rewritten from scratch — simple trend-following breakout, not a
+multi-indicator voting scheme):
+  - Only trade WITH the trend: EMA50 vs EMA200, confirmed by ADX > ADX_MIN
+    (avoids trading in a flat/choppy market).
+  - Entry: price breaks out beyond its recent N-candle high/low in the
+    trend's direction — a real structural signal, not indicator noise.
+  - Stop-loss and take-profit are both based on ATR (current volatility),
+    not a fixed tiny percentage — this avoids getting stopped out by normal
+    noise, and keeps a healthy ~2:1 reward:risk ratio (TP_ATR_MULT / SL_ATR_MULT).
+  - A daily-timeframe bias filter must not contradict the trade direction.
+  - Fewer, higher-quality trades — not a high-frequency scalp count.
 """
 
 import os
@@ -23,26 +35,27 @@ OANDA_API_TOKEN = os.environ.get("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 
 INSTRUMENTS = ["XAU_USD", "EUR_USD", "GBP_USD"]
-GRANULARITY = "M15"
+GRANULARITY = "M15"        # 15-minute candles — enough structure for real breakouts
 CANDLE_COUNT = 500
 
-BREAKOUT_LOOKBACK = 20
-ADX_MIN = 20
-RSI_UPPER = 75
-RSI_LOWER = 25
-SL_ATR_MULT = 1.5
-TP_ATR_MULT = 3.0
+# ── Strategy parameters ──
+BREAKOUT_LOOKBACK = 20      # N-candle high/low breakout
+ADX_MIN = 20                # minimum trend strength to trade at all
+RSI_UPPER = 75              # skip new longs if RSI already this overbought
+RSI_LOWER = 25              # skip new shorts if RSI already this oversold
+SL_ATR_MULT = 1.5           # stop-loss = 1.5x ATR
+TP_ATR_MULT = 3.0           # take-profit = 3.0x ATR  (~2:1 reward:risk)
 
 ALLOW_SHORTING = True
 
-MAX_TRADES_PER_DAY = 30
-MAX_POSITION_FRACTION = 0.05
-DAILY_LOSS_LIMIT_FRACTION = 0.10
-COOLDOWN_SECONDS_AFTER_TRADE = 120
+MAX_TRADES_PER_DAY = 30                # shared across all instruments
+MAX_POSITION_FRACTION = 0.05           # 5% of equity RISKED (lost if SL hit) per trade
+DAILY_LOSS_LIMIT_FRACTION = 0.10       # shared across all instruments (£100 on a £1000 account)
+COOLDOWN_SECONDS_AFTER_TRADE = 120     # per-instrument cooldown
 KILL_SWITCH_FILE = "STOP"
 
-STATE_FILE = "bot_state.csv"
-ACTIVITY_FILE = "bot_activity.csv"
+STATE_FILE = "bot_state_v2.csv"
+ACTIVITY_FILE = "bot_activity_v2.csv"
 
 NEWS_FILTER_ENABLED = True
 NEWS_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
@@ -132,6 +145,7 @@ def place_market_order(session, instrument, units, stop_loss_price=None, take_pr
 
 
 def get_instruments_details(session, instruments):
+    """Returns {instrument: {marginRate: float, displayPrecision: int}} for all requested instruments in one call."""
     details = {}
     try:
         data = oanda_request(
@@ -177,7 +191,7 @@ def get_candles(session, instrument, granularity, count):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# INDICATORS
+# INDICATORS (kept minimal and purposeful — no indicator-zoo voting)
 # ══════════════════════════════════════════════════════════════════════════
 
 def add_trend(df):
@@ -228,12 +242,14 @@ def add_adx(df, period=14):
 
 
 def add_breakout_levels(df, lookback=BREAKOUT_LOOKBACK):
+    # prior N-candle high/low, EXCLUDING the current candle (shift(1)) to avoid look-ahead
     df["breakout_high"] = df["high"].rolling(lookback).max().shift(1)
     df["breakout_low"] = df["low"].rolling(lookback).min().shift(1)
     return df
 
 
 def get_htf_bias(session, instrument):
+    """Daily-timeframe bias: +1 if price above daily EMA20, -1 if below, 0 if unclear."""
     try:
         df = get_candles(session, instrument, "D", 60)
         if len(df) < 20:
@@ -251,6 +267,8 @@ def in_active_session():
     ny = 12 <= hour <= 21
     return london or ny
 
+
+# ── NEWS FILTER ─────────────────────────────────────────────────────────
 
 def fetch_news_events():
     if not NEWS_FILTER_ENABLED:
@@ -272,7 +290,7 @@ def fetch_news_events():
             filtered.append({"time": ev_time, "title": ev.get("title", "")})
         return filtered
     except Exception:
-        return []
+        return []  # fail open — never block trading due to a feed outage
 
 
 def in_news_blackout(news_events):
@@ -290,13 +308,14 @@ def in_news_blackout(news_events):
 # ══════════════════════════════════════════════════════════════════════════
 
 def decide_from_row(row, daily_bias=0):
+    """Trend + breakout + strength filter. Returns 'buy' / 'sell' / 'none'."""
     required = ["ema50", "ema200", "adx", "rsi", "atr", "breakout_high", "breakout_low", "close"]
     for col in required:
         if pd.isna(row.get(col, np.nan)):
             return "none"
 
     if row["adx"] < ADX_MIN:
-        return "none"
+        return "none"  # market isn't trending enough — sit out
 
     trend_up = row["close"] > row["ema50"] > row["ema200"]
     trend_down = row["close"] < row["ema50"] < row["ema200"]
@@ -436,7 +455,7 @@ def process_instrument(session, instrument, instrument_details, state, news_even
     margin_available = account["margin_available"]
 
     df = get_candles(session, instrument, GRANULARITY, CANDLE_COUNT)
-    if len(df) < 210:
+    if len(df) < 210:  # need enough for EMA200 to be meaningful
         log_row({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "instrument": instrument,
