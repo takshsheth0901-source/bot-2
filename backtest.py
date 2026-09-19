@@ -1,319 +1,308 @@
 """
-REAL BACKTEST ENGINE
-
-Pulls genuine historical OANDA gold price data and runs it through the
-EXACT SAME strategy code as the live bot (imported directly from bot.py,
-not reimplemented), simulates trades using the same stop-loss/take-profit/
-position-sizing/risk rules as live trading, and reports honest performance
-metrics with an out-of-sample train/test split.
-
-Usage:
-    Set OANDA_API_TOKEN and OANDA_ACCOUNT_ID as environment variables, then:
-    python backtest.py
+Backtest for the multi-pair OANDA trend-breakout bot. Reuses bot.py's exact
+indicator/decision/position-sizing logic (imported directly) so the backtest
+can never drift from what the live bot actually does.
 """
 
-import time
-from datetime import datetime, timedelta
+import os
+import sys
+from datetime import datetime, timedelta, timezone
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
-import bot   # reuses the live bot's exact indicator/scoring/risk logic
+import bot  # reuse the live bot's exact logic
 
-
-BACKTEST_DAYS = 30
-BACKTEST_GRANULARITY = "M5"
+BACKTEST_DAYS = 180
 TRAIN_FRACTION = 0.6
-STARTING_EQUITY = 100000.0
+STARTING_EQUITY = 1000.0
+SPREAD_COST_PER_UNIT = {
+    "XAU_USD": 0.30,
+    "EUR_USD": 0.00008,
+    "GBP_USD": 0.00010,
+}
+MARGIN_RATE_FALLBACK = {
+    "XAU_USD": 0.05,
+    "EUR_USD": 0.02,
+    "GBP_USD": 0.02,
+}
 
 
 def fetch_historical_candles(session, instrument, granularity, days):
-    all_rows = []
-    to_time = datetime.utcnow()
-    earliest_needed = to_time - timedelta(days=days)
-    iterations = 0
-    max_iterations = 20
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=days)
 
-    while to_time > earliest_needed and iterations < max_iterations:
+    all_rows = []
+    cursor = start_time
+    max_iterations = 60
+    iteration = 0
+
+    while cursor < end_time and iteration < max_iterations:
+        iteration += 1
         params = {
             "granularity": granularity,
+            "from": cursor.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
             "count": 5000,
             "price": "M",
-            "to": to_time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z"),
         }
-        data = bot.oanda_request(session, "GET", f"/v3/instruments/{instrument}/candles", params=params)
-        candles = data["candles"]
+        data = bot.oanda_request(
+            session, "GET",
+            f"/v3/instruments/{instrument}/candles",
+            params=params,
+        )
+        candles = data.get("candles", [])
         if not candles:
             break
 
         for c in candles:
-            if not c.get("complete", False):
+            if not c["complete"]:
                 continue
-            mid = c["mid"]
             all_rows.append({
                 "time": c["time"],
-                "Open": float(mid["o"]),
-                "High": float(mid["h"]),
-                "Low": float(mid["l"]),
-                "Close": float(mid["c"]),
-                "Volume": int(c.get("volume", 0)),
+                "open": float(c["mid"]["o"]),
+                "high": float(c["mid"]["h"]),
+                "low": float(c["mid"]["l"]),
+                "close": float(c["mid"]["c"]),
+                "volume": int(c["volume"]),
             })
 
-        earliest_in_batch = datetime.strptime(candles[0]["time"][:19], "%Y-%m-%dT%H:%M:%S")
-        if earliest_in_batch >= to_time.replace(microsecond=0):
+        last_time = pd.to_datetime(candles[-1]["time"])
+        if last_time.to_pydatetime().replace(tzinfo=timezone.utc) <= cursor:
             break
-        to_time = earliest_in_batch
-        iterations += 1
-        time.sleep(0.2)
+        cursor = last_time.to_pydatetime().replace(tzinfo=timezone.utc) + timedelta(seconds=1)
 
-    df = pd.DataFrame(all_rows).drop_duplicates(subset="time").sort_values("time")
-    df = df.set_index("time")
+        if len(candles) < 5000:
+            break
+
+    df = pd.DataFrame(all_rows).drop_duplicates(subset="time").reset_index(drop=True)
+    df["time"] = pd.to_datetime(df["time"])
     return df
 
 
-def build_features_with_htf_bias(df):
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
+def build_daily_bias(df):
+    df = df.copy().set_index("time")
+    daily_close = df["close"].resample("1D").last().ffill()
+    ema20 = daily_close.ewm(span=20, adjust=False).mean()
+    bias = (daily_close > ema20).astype(int) * 2 - 1
+    bias = bias.shift(1)
+    bias = bias.reindex(df.index, method="ffill").fillna(0)
+    df["daily_bias"] = bias
+    return df.reset_index()
 
-    df = bot.add_indicators(df)
-    df = bot.add_candle_patterns(df)
-    df = bot.add_bollinger_bands(df)
+
+def simulate_trades(df, instrument):
+    df = bot.add_trend(df)
+    df = bot.add_rsi(df)
     df = bot.add_atr(df)
-    df = bot.add_volume_signal(df)
-    df = bot.add_fibonacci_signal(df)
-    df = bot.add_ict_signals(df)
     df = bot.add_adx(df)
-    df = bot.add_stochastic(df)
-    df = bot.add_cci(df)
-    df = bot.add_mfi(df)
-    df = bot.add_vwap(df)
+    df = bot.add_breakout_levels(df)
 
-    for label, rule in [("D", "1D"), ("H4", "4h"), ("H1", "1h")]:
-        htf = df["Close"].resample(rule).last().ffill()
-        htf_ema20 = htf.ewm(span=20, adjust=False).mean()
-        htf_bull = (htf > htf_ema20).shift(1)
-        df[f"htf_bull_{label}"] = htf_bull.reindex(df.index, method="ffill")
+    spread_cost = SPREAD_COST_PER_UNIT.get(instrument, 0.0001)
+    margin_rate = MARGIN_RATE_FALLBACK.get(instrument, 0.05)
 
-    votes = df[["htf_bull_D", "htf_bull_H4", "htf_bull_H1"]]
-    all_bull = votes.all(axis=1)
-    all_bear = (~votes.fillna(True)).all(axis=1) & votes.notna().all(axis=1)
-    df["htf_bias"] = 0
-    df.loc[all_bull, "htf_bias"] = 1
-    df.loc[all_bear, "htf_bias"] = -1
-
-    df["in_session"] = [bot.in_active_session(str(t)) for t in df.index]
-
-    df["score"] = df.apply(
-        lambda row: bot.score_row(row, htf_bias=row["htf_bias"], in_session=row["in_session"]),
-        axis=1
-    )
-    return df
-
-
-def simulate_trades(df, starting_equity=STARTING_EQUITY):
-    equity = starting_equity
-    position = 0.0
-    entry_price = None
-    entry_time = None
-    stop_loss = None
-    take_profit = None
+    equity = STARTING_EQUITY
     trades = []
-    equity_curve = []
+    open_trade = None
 
-    trades_today = 0
-    current_day = None
-    last_trade_bar = -999
-    starting_equity_today = equity
+    warmup = 210
+    for i in range(warmup, len(df)):
+        row = df.iloc[i]
+        price = row["close"]
+        high = row["high"]
+        low = row["low"]
 
-    for i, (ts, row) in enumerate(df.iterrows()):
-        day = ts.date()
-        if day != current_day:
-            current_day = day
-            trades_today = 0
-            starting_equity_today = equity
-
-        price = row["Close"]
-
-        if position != 0:
-            hit_sl = hit_tp = False
-            if position > 0:
-                hit_sl = row["Low"] <= stop_loss
-                hit_tp = row["High"] >= take_profit
+        if open_trade is not None:
+            direction = open_trade["direction"]
+            if direction == "buy":
+                hit_sl = low <= open_trade["sl"]
+                hit_tp = high >= open_trade["tp"]
             else:
-                hit_sl = row["High"] >= stop_loss
-                hit_tp = row["Low"] <= take_profit
+                hit_sl = high >= open_trade["sl"]
+                hit_tp = low <= open_trade["tp"]
 
-            exit_price = None
-            outcome = None
-            if hit_sl and hit_tp:
-                exit_price = stop_loss
-                outcome = "loss"
-            elif hit_sl:
-                exit_price = stop_loss
-                outcome = "loss"
-            elif hit_tp:
-                exit_price = take_profit
-                outcome = "win"
-
-            if exit_price is not None:
-                pnl = (exit_price - entry_price) * position
+            if hit_sl or hit_tp:
+                exit_price = open_trade["sl"] if hit_sl else open_trade["tp"]
+                if direction == "buy":
+                    pnl = (exit_price - open_trade["entry_price"]) * open_trade["units"]
+                else:
+                    pnl = (open_trade["entry_price"] - exit_price) * open_trade["units"]
+                pnl -= spread_cost * open_trade["units"]
                 equity += pnl
                 trades.append({
-                    "entry_time": entry_time, "exit_time": ts,
-                    "direction": "long" if position > 0 else "short",
-                    "entry_price": entry_price, "exit_price": exit_price,
-                    "units": abs(position), "pnl": pnl, "outcome": outcome,
+                    "entry_time": open_trade["entry_time"],
+                    "exit_time": row["time"],
+                    "direction": direction,
+                    "pnl": pnl,
+                    "win": pnl > 0,
                 })
-                position = 0.0
-                entry_price = stop_loss = take_profit = None
+                open_trade = None
 
-        if starting_equity_today > 0:
-            drawdown_today = (starting_equity_today - equity) / starting_equity_today
+        if open_trade is not None:
+            continue
+
+        daily_bias = row.get("daily_bias", 0)
+        decision = bot.decide_from_row(row, daily_bias=daily_bias)
+
+        if decision == "none":
+            continue
+
+        atr = row.get("atr")
+        if pd.isna(atr) or atr <= 0:
+            continue
+
+        stop_distance = atr * bot.SL_ATR_MULT
+        tp_distance = atr * bot.TP_ATR_MULT
+        risk_amount = equity * bot.MAX_POSITION_FRACTION
+        risk_based_units = int(risk_amount / stop_distance) if stop_distance > 0 else 0
+
+        margin_available = equity
+        margin_based_units = int((margin_available * 0.9) / (price * margin_rate)) if price > 0 else 0
+
+        units = min(risk_based_units, margin_based_units)
+        if units <= 0:
+            continue
+
+        if decision == "buy":
+            sl = price - stop_distance
+            tp = price + tp_distance
         else:
-            drawdown_today = 0
-        daily_limit_hit = drawdown_today >= bot.DAILY_LOSS_LIMIT_FRACTION
+            sl = price + stop_distance
+            tp = price - tp_distance
 
-        cooldown_bars = max(1, bot.COOLDOWN_SECONDS_AFTER_TRADE // (5 * 60))
-        in_cooldown = (i - last_trade_bar) < cooldown_bars
-
-        if (position == 0 and not daily_limit_hit and not in_cooldown
-                and trades_today < bot.MAX_TRADES_PER_DAY):
-            score = row["score"]
-            if score >= bot.BUY_SCORE_THRESHOLD:
-                cash_to_risk = equity * bot.MAX_POSITION_FRACTION
-                units = int(cash_to_risk // price)
-                if units > 0:
-                    position = units
-                    entry_price = price
-                    entry_time = ts
-                    stop_loss = price * (1 - bot.STOP_LOSS_PCT / 100)
-                    take_profit = price * (1 + bot.TAKE_PROFIT_PCT / 100)
-                    trades_today += 1
-                    last_trade_bar = i
-            elif score <= bot.SELL_SCORE_THRESHOLD and bot.ALLOW_SHORTING:
-                cash_to_risk = equity * bot.MAX_POSITION_FRACTION
-                units = int(cash_to_risk // price)
-                if units > 0:
-                    position = -units
-                    entry_price = price
-                    entry_time = ts
-                    stop_loss = price * (1 + bot.STOP_LOSS_PCT / 100)
-                    take_profit = price * (1 - bot.TAKE_PROFIT_PCT / 100)
-                    trades_today += 1
-                    last_trade_bar = i
-
-        equity_curve.append({"time": ts, "equity": equity})
-
-    return pd.DataFrame(trades), pd.DataFrame(equity_curve)
-
-
-def compute_metrics(trades_df, equity_df, starting_equity):
-    if trades_df.empty:
-        return {
-            "num_trades": 0, "win_rate": None, "avg_win": None, "avg_loss": None,
-            "expectancy": None, "profit_factor": None, "max_drawdown_pct": None,
-            "sharpe": None, "final_equity": starting_equity, "return_pct": 0.0,
+        open_trade = {
+            "direction": decision,
+            "entry_price": price,
+            "entry_time": row["time"],
+            "sl": sl,
+            "tp": tp,
+            "units": units,
         }
 
-    wins = trades_df[trades_df["pnl"] > 0]["pnl"]
-    losses = trades_df[trades_df["pnl"] <= 0]["pnl"]
+    return trades, equity
 
-    win_rate = len(wins) / len(trades_df) * 100
-    avg_win = wins.mean() if len(wins) else 0
-    avg_loss = losses.mean() if len(losses) else 0
-    expectancy = trades_df["pnl"].mean()
-    gross_profit = wins.sum()
-    gross_loss = abs(losses.sum())
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
 
-    equity_series = equity_df["equity"]
-    running_max = equity_series.cummax()
-    drawdown = (equity_series - running_max) / running_max
-    max_drawdown_pct = drawdown.min() * 100
+def compute_metrics(trades, starting_equity, final_equity):
+    if not trades:
+        return {
+            "num_trades": 0,
+            "win_rate": None,
+            "avg_win": None,
+            "avg_loss": None,
+            "expectancy": None,
+            "profit_factor": None,
+            "max_drawdown_pct": None,
+            "sharpe": None,
+            "total_return_pct": (final_equity - starting_equity) / starting_equity * 100,
+        }
 
-    trade_returns = trades_df["pnl"] / starting_equity
-    sharpe = (trade_returns.mean() / trade_returns.std() * np.sqrt(len(trade_returns))
-              if trade_returns.std() > 0 and len(trade_returns) > 1 else 0)
+    pnls = [t["pnl"] for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
 
-    final_equity = equity_series.iloc[-1]
-    return_pct = (final_equity / starting_equity - 1) * 100
+    win_rate = len(wins) / len(pnls) * 100
+    avg_win = np.mean(wins) if wins else 0
+    avg_loss = np.mean(losses) if losses else 0
+    expectancy = np.mean(pnls)
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    equity_curve = [starting_equity]
+    for p in pnls:
+        equity_curve.append(equity_curve[-1] + p)
+    equity_curve = np.array(equity_curve)
+    running_max = np.maximum.accumulate(equity_curve)
+    drawdown = (equity_curve - running_max) / running_max * 100
+    max_drawdown_pct = drawdown.min()
+
+    returns = np.array(pnls) / starting_equity
+    sharpe = (returns.mean() / returns.std() * np.sqrt(len(returns))) if returns.std() > 0 else 0
 
     return {
-        "num_trades": len(trades_df), "win_rate": win_rate, "avg_win": avg_win,
-        "avg_loss": avg_loss, "expectancy": expectancy, "profit_factor": profit_factor,
-        "max_drawdown_pct": max_drawdown_pct, "sharpe": sharpe,
-        "final_equity": final_equity, "return_pct": return_pct,
+        "num_trades": len(trades),
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "expectancy": expectancy,
+        "profit_factor": profit_factor,
+        "max_drawdown_pct": max_drawdown_pct,
+        "sharpe": sharpe,
+        "total_return_pct": (final_equity - starting_equity) / starting_equity * 100,
     }
 
 
-def print_report(label, metrics):
-    print(f"\n{'='*50}")
-    print(f"  {label}")
-    print(f"{'='*50}")
-    if metrics["num_trades"] == 0:
-        print("  No trades taken in this period.")
+def print_metrics(label, m):
+    print(f"\n--- {label} ---")
+    if m["num_trades"] == 0:
+        print("No trades taken.")
+        print(f"Total return: {m['total_return_pct']:.2f}%")
         return
-    print(f"  Number of trades:    {metrics['num_trades']}")
-    print(f"  Win rate:            {metrics['win_rate']:.1f}%")
-    print(f"  Average win:         {metrics['avg_win']:.2f}")
-    print(f"  Average loss:        {metrics['avg_loss']:.2f}")
-    print(f"  Expectancy/trade:    {metrics['expectancy']:.2f}")
-    print(f"  Profit factor:       {metrics['profit_factor']:.2f}")
-    print(f"  Max drawdown:        {metrics['max_drawdown_pct']:.2f}%")
-    print(f"  Sharpe (per-trade):  {metrics['sharpe']:.2f}")
-    print(f"  Final equity:        {metrics['final_equity']:.2f}")
-    print(f"  Total return:        {metrics['return_pct']:.2f}%")
+    print(f"Trades:          {m['num_trades']}")
+    print(f"Win rate:        {m['win_rate']:.1f}%")
+    print(f"Avg win:         {m['avg_win']:.2f}")
+    print(f"Avg loss:        {m['avg_loss']:.2f}")
+    print(f"Expectancy:      {m['expectancy']:.2f} per trade")
+    print(f"Profit factor:   {m['profit_factor']:.2f}")
+    print(f"Max drawdown:    {m['max_drawdown_pct']:.2f}%")
+    print(f"Sharpe (approx): {m['sharpe']:.2f}")
+    print(f"Total return:    {m['total_return_pct']:.2f}%")
 
 
 def run_backtest():
-    if not bot.OANDA_API_TOKEN or not bot.OANDA_ACCOUNT_ID:
-        print("ERROR: OANDA_API_TOKEN / OANDA_ACCOUNT_ID not set.")
-        return
-
     session = bot.oanda_session()
-    print(f"Fetching {BACKTEST_DAYS} days of {BACKTEST_GRANULARITY} gold data from OANDA...")
-    df = fetch_historical_candles(session, bot.INSTRUMENT, BACKTEST_GRANULARITY, BACKTEST_DAYS)
-    print(f"Got {len(df)} candles, from {df.index.min()} to {df.index.max()}")
 
-    print("Computing indicators and scores (same logic as the live bot)...")
-    feat = build_features_with_htf_bias(df)
-    feat = feat.dropna(subset=["RSI", "MACD_signal", "BB_percent_b", "ATR_pct"])
+    combined_test_trades = []
 
-    split_idx = int(len(feat) * TRAIN_FRACTION)
-    train, test = feat.iloc[:split_idx], feat.iloc[split_idx:]
+    for instrument in bot.INSTRUMENTS:
+        print(f"\n{'='*70}\nBACKTESTING {instrument}\n{'='*70}")
+        print(f"Fetching {BACKTEST_DAYS} days of {bot.GRANULARITY} candles...")
 
-    print(f"\nTrain period: {train.index.min()} to {train.index.max()} ({len(train)} bars)")
-    print(f"Test period:  {test.index.min()} to {test.index.max()} ({len(test)} bars)")
+        raw_df = fetch_historical_candles(session, instrument, bot.GRANULARITY, BACKTEST_DAYS)
+        if len(raw_df) < 400:
+            print(f"Not enough data for {instrument} ({len(raw_df)} candles) — skipping.")
+            continue
+        print(f"Got {len(raw_df)} candles.")
 
-    train_trades, train_equity = simulate_trades(train)
-    test_trades, test_equity = simulate_trades(test)
+        df = build_daily_bias(raw_df)
 
-    train_metrics = compute_metrics(train_trades, train_equity, STARTING_EQUITY)
-    test_metrics = compute_metrics(test_trades, test_equity, STARTING_EQUITY)
+        split_idx = int(len(df) * TRAIN_FRACTION)
+        train_df = df.iloc[:split_idx].reset_index(drop=True)
+        test_df = df.iloc[split_idx:].reset_index(drop=True)
 
-    print_report("TRAINING PERIOD (seen during tuning)", train_metrics)
-    print_report("TEST PERIOD (out-of-sample - the honest number)", test_metrics)
+        train_trades, train_final_equity = simulate_trades(train_df, instrument)
+        test_trades, test_final_equity = simulate_trades(test_df, instrument)
 
-    print(f"\n{'='*50}")
-    print("  OVERFITTING CHECK")
-    print(f"{'='*50}")
-    if train_metrics["num_trades"] > 0 and test_metrics["num_trades"] > 0:
-        gap = train_metrics["return_pct"] - test_metrics["return_pct"]
-        print(f"  Train return: {train_metrics['return_pct']:.2f}%  |  Test return: {test_metrics['return_pct']:.2f}%")
-        if gap > 15:
-            print("  WARNING: training performance is much stronger than out-of-sample.")
-            print("  This is a classic overfitting sign - treat the strategy with caution.")
+        train_metrics = compute_metrics(train_trades, STARTING_EQUITY, train_final_equity)
+        test_metrics = compute_metrics(test_trades, STARTING_EQUITY, test_final_equity)
+
+        print_metrics(f"{instrument} — TRAIN ({TRAIN_FRACTION*100:.0f}% of data)", train_metrics)
+        print_metrics(f"{instrument} — TEST ({(1-TRAIN_FRACTION)*100:.0f}% of data, held out)", test_metrics)
+
+        print(f"\n--- {instrument} OVERFITTING CHECK ---")
+        if train_metrics["num_trades"] > 0 and test_metrics["num_trades"] > 0:
+            train_ret = train_metrics["total_return_pct"]
+            test_ret = test_metrics["total_return_pct"]
+            print(f"Train return: {train_ret:.2f}%  |  Test return: {test_ret:.2f}%")
+            if (train_ret > 0) != (test_ret > 0):
+                print("WARNING: train and test disagree on direction — likely overfit or unstable edge.")
+            elif abs(train_ret - test_ret) > abs(train_ret) * 0.5 + 5:
+                print("CAUTION: large gap between train and test performance — treat with skepticism.")
+            else:
+                print("Train/test results are broadly consistent.")
         else:
-            print("  Train/test performance is reasonably close - a healthier sign,")
-            print("  though this is still a limited sample, not a guarantee.")
-    else:
-        print("  Not enough trades in one or both periods to assess overfitting.")
-        print("  This itself is informative: the strategy may be too selective")
-        print("  for this data window, or the market didn't offer qualifying setups.")
+            print("Not enough trades in one or both halves to assess overfitting.")
 
-    if test_metrics["num_trades"] > 0 and test_metrics["num_trades"] < 20:
-        print(f"\n  NOTE: only {test_metrics['num_trades']} out-of-sample trades.")
-        print("  That's too small a sample to draw strong conclusions either way.")
+        combined_test_trades.extend(test_trades)
+
+    print(f"\n{'='*70}\nCOMBINED TEST-SET RESULTS (ALL INSTRUMENTS, HELD-OUT DATA ONLY)\n{'='*70}")
+    combined_final_equity = STARTING_EQUITY + sum(t["pnl"] for t in combined_test_trades)
+    combined_metrics = compute_metrics(combined_test_trades, STARTING_EQUITY, combined_final_equity)
+    print_metrics("Combined (test-set only)", combined_metrics)
+
+    print("\nNote: this backtest approximates spread costs and assumes no simultaneous")
+    print("cross-instrument margin competition. It is built from the exact same")
+    print("decision/sizing logic as the live bot, so it is a genuine estimate.")
 
 
 if __name__ == "__main__":
