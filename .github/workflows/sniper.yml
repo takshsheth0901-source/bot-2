@@ -1,0 +1,34 @@
+name: Memecoin Sniper
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-sniper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests solders base58
+
+      - name: Run sniper
+        env:
+          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+          SOLANA_WALLET_PRIVATE_KEY: ${{ secrets.SOLANA_WALLET_PRIVATE_KEY }}
+          SOLANA_TRACKER_API_KEY: ${{ secrets.SOLANA_TRACKER_API_KEY }}
+        run: python memecoin_sniper.py
+
+      - name: Commit state and log
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add sniper_state.json sniper_activity.csv
+          git diff --staged --quiet || git commit -m "Update sniper state [skip ci]"
+          git push
