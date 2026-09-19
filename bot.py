@@ -1,5 +1,5 @@
 """
-Automated multi-pair trading bot for OANDA (Gold + EUR/USD + GBP/USD).
+Automated multi-pair trend-breakout trading bot for OANDA (Gold + EUR/USD + GBP/USD).
 Runs once per invocation — intended to be triggered every 5 minutes by GitHub Actions.
 """
 
@@ -23,19 +23,21 @@ OANDA_API_TOKEN = os.environ.get("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 
 INSTRUMENTS = ["XAU_USD", "EUR_USD", "GBP_USD"]
-GRANULARITY = "M1"
-CANDLE_COUNT = 300
+GRANULARITY = "M15"
+CANDLE_COUNT = 500
 
-STOP_LOSS_PCT = 0.15
-TAKE_PROFIT_PCT = 0.30
+BREAKOUT_LOOKBACK = 20
+ADX_MIN = 20
+RSI_UPPER = 75
+RSI_LOWER = 25
+SL_ATR_MULT = 1.5
+TP_ATR_MULT = 3.0
+
 ALLOW_SHORTING = True
-
-BUY_SCORE_THRESHOLD = 1
-SELL_SCORE_THRESHOLD = -1
 
 MAX_TRADES_PER_DAY = 30
 MAX_POSITION_FRACTION = 0.05
-DAILY_LOSS_LIMIT_FRACTION = 0.10       # shared across all instruments (£100 on a £1000 account)
+DAILY_LOSS_LIMIT_FRACTION = 0.10
 COOLDOWN_SECONDS_AFTER_TRADE = 120
 KILL_SWITCH_FILE = "STOP"
 
@@ -130,7 +132,6 @@ def place_market_order(session, instrument, units, stop_loss_price=None, take_pr
 
 
 def get_instruments_details(session, instruments):
-    """Returns {instrument: {marginRate: float, displayPrecision: int}} for all requested instruments in one call."""
     details = {}
     try:
         data = oanda_request(
@@ -179,34 +180,21 @@ def get_candles(session, instrument, granularity, count):
 # INDICATORS
 # ══════════════════════════════════════════════════════════════════════════
 
-def add_indicators(df):
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    df["rsi"] = df["rsi"].fillna(50)
-
-    ema12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+def add_trend(df):
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
     return df
 
 
-def add_bollinger_bands(df, period=20, std_mult=2):
-    mid = df["close"].rolling(period).mean()
-    std = df["close"].rolling(period).std()
-    df["bb_mid"] = mid
-    df["bb_upper"] = mid + std_mult * std
-    df["bb_lower"] = mid - std_mult * std
+def add_rsi(df, period=14):
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(50)
     return df
 
 
@@ -216,37 +204,6 @@ def add_atr(df, period=14):
     low_close = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / period, min_periods=period).mean()
-    return df
-
-
-def add_volume_signal(df, period=20):
-    avg_vol = df["volume"].rolling(period).mean()
-    df["vol_ratio"] = df["volume"] / avg_vol.replace(0, np.nan)
-    df["vol_spike"] = df["vol_ratio"] > 1.5
-    return df
-
-
-def add_fibonacci_signal(df, lookback=50):
-    roll_high = df["high"].rolling(lookback).max()
-    roll_low = df["low"].rolling(lookback).min()
-    rng = (roll_high - roll_low).replace(0, np.nan)
-    fib_618 = roll_low + 0.618 * rng
-    fib_50 = roll_low + 0.5 * rng
-    df["near_fib_618"] = (df["close"] - fib_618).abs() / rng < 0.01
-    df["near_fib_50"] = (df["close"] - fib_50).abs() / rng < 0.01
-    return df
-
-
-def add_ict_signals(df):
-    prev_low = df["low"].shift(1)
-    prev_high = df["high"].shift(1)
-    df["liquidity_sweep_low"] = (df["low"] < prev_low) & (df["close"] > prev_low)
-    df["liquidity_sweep_high"] = (df["high"] > prev_high) & (df["close"] < prev_high)
-
-    bull_ob = (df["close"].shift(1) < df["open"].shift(1)) & (df["close"] > df["high"].shift(1))
-    bear_ob = (df["close"].shift(1) > df["open"].shift(1)) & (df["close"] < df["low"].shift(1))
-    df["order_block_bull"] = bull_ob
-    df["order_block_bear"] = bear_ob
     return df
 
 
@@ -267,62 +224,24 @@ def add_adx(df, period=14):
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     df["adx"] = dx.ewm(alpha=1 / period, min_periods=period).mean()
-    df["plus_di"] = plus_di
-    df["minus_di"] = minus_di
     return df
 
 
-def add_stochastic(df, k_period=14, d_period=3):
-    low_min = df["low"].rolling(k_period).min()
-    high_max = df["high"].rolling(k_period).max()
-    df["stoch_k"] = 100 * (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan)
-    df["stoch_d"] = df["stoch_k"].rolling(d_period).mean()
-    return df
-
-
-def add_cci(df, period=20):
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    sma = tp.rolling(period).mean()
-    mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-    df["cci"] = (tp - sma) / (0.015 * mad.replace(0, np.nan))
-    return df
-
-
-def add_mfi(df, period=14):
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    raw_money_flow = tp * df["volume"]
-    positive_flow = np.where(tp > tp.shift(1), raw_money_flow, 0.0)
-    negative_flow = np.where(tp < tp.shift(1), raw_money_flow, 0.0)
-    pos_sum = pd.Series(positive_flow, index=df.index).rolling(period).sum()
-    neg_sum = pd.Series(negative_flow, index=df.index).rolling(period).sum()
-    money_ratio = pos_sum / neg_sum.replace(0, np.nan)
-    df["mfi"] = 100 - (100 / (1 + money_ratio))
-    df["mfi"] = df["mfi"].fillna(50)
-    return df
-
-
-def add_vwap(df, period=50):
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    pv = tp * df["volume"]
-    df["vwap"] = pv.rolling(period).sum() / df["volume"].rolling(period).sum().replace(0, np.nan)
+def add_breakout_levels(df, lookback=BREAKOUT_LOOKBACK):
+    df["breakout_high"] = df["high"].rolling(lookback).max().shift(1)
+    df["breakout_low"] = df["low"].rolling(lookback).min().shift(1)
     return df
 
 
 def get_htf_bias(session, instrument):
-    bias = 0
     try:
-        for gran, weight in [("D", 1), ("H4", 1), ("H1", 1)]:
-            df = get_candles(session, instrument, gran, 60)
-            if len(df) < 20:
-                continue
-            ema20 = df["close"].ewm(span=20, adjust=False).mean()
-            if df["close"].iloc[-1] > ema20.iloc[-1]:
-                bias += weight
-            else:
-                bias -= weight
+        df = get_candles(session, instrument, "D", 60)
+        if len(df) < 20:
+            return 0
+        ema20 = df["close"].ewm(span=20, adjust=False).mean()
+        return 1 if df["close"].iloc[-1] > ema20.iloc[-1] else -1
     except Exception:
         return 0
-    return bias
 
 
 def in_active_session():
@@ -367,125 +286,44 @@ def in_news_blackout(news_events):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# SCORING
+# DECISION LOGIC
 # ══════════════════════════════════════════════════════════════════════════
 
-def score_row(row, htf_bias=0, in_session=False):
-    score = 0
+def decide_from_row(row, daily_bias=0):
+    required = ["ema50", "ema200", "adx", "rsi", "atr", "breakout_high", "breakout_low", "close"]
+    for col in required:
+        if pd.isna(row.get(col, np.nan)):
+            return "none"
 
-    if row["close"] > row["ema20"]:
-        score += 1
-    else:
-        score -= 1
+    if row["adx"] < ADX_MIN:
+        return "none"
 
-    if row["macd_hist"] > 0:
-        score += 1
-    else:
-        score -= 1
+    trend_up = row["close"] > row["ema50"] > row["ema200"]
+    trend_down = row["close"] < row["ema50"] < row["ema200"]
 
-    if row["rsi"] < 30:
-        score += 1
-    elif row["rsi"] > 70:
-        score -= 1
+    if trend_up and daily_bias >= 0:
+        if row["close"] > row["breakout_high"] and row["rsi"] < RSI_UPPER:
+            return "buy"
 
-    if not pd.isna(row.get("bb_lower", np.nan)) and row["close"] < row["bb_lower"]:
-        score += 1
-    if not pd.isna(row.get("bb_upper", np.nan)) and row["close"] > row["bb_upper"]:
-        score -= 1
+    if trend_down and daily_bias <= 0:
+        if row["close"] < row["breakout_low"] and row["rsi"] > RSI_LOWER:
+            return "sell"
 
-    if not pd.isna(row.get("adx", np.nan)) and row["adx"] > 20:
-        if row.get("plus_di", 0) > row.get("minus_di", 0):
-            score += 1
-        else:
-            score -= 1
-
-    if not pd.isna(row.get("stoch_k", np.nan)):
-        if row["stoch_k"] < 20 and row["stoch_k"] > row.get("stoch_d", 0):
-            score += 1
-        elif row["stoch_k"] > 80 and row["stoch_k"] < row.get("stoch_d", 100):
-            score -= 1
-
-    if not pd.isna(row.get("cci", np.nan)):
-        if row["cci"] < -100:
-            score += 1
-        elif row["cci"] > 100:
-            score -= 1
-
-    if not pd.isna(row.get("mfi", np.nan)):
-        if row["mfi"] < 20:
-            score += 1
-        elif row["mfi"] > 80:
-            score -= 1
-
-    if not pd.isna(row.get("vwap", np.nan)):
-        if row["close"] > row["vwap"]:
-            score += 1
-        else:
-            score -= 1
-
-    if row.get("liquidity_sweep_low", False) or row.get("order_block_bull", False):
-        score += 1
-    if row.get("liquidity_sweep_high", False) or row.get("order_block_bear", False):
-        score -= 1
-
-    if row.get("near_fib_618", False) or row.get("near_fib_50", False):
-        if score > 0:
-            score += 1
-        elif score < 0:
-            score -= 1
-
-    if row.get("vol_spike", False):
-        if score > 0:
-            score += 1
-        elif score < 0:
-            score -= 1
-
-    if htf_bias > 0 and score > 0:
-        score += 1
-    elif htf_bias < 0 and score < 0:
-        score -= 1
-
-    if in_session:
-        if score > 0:
-            score += 1
-        elif score < 0:
-            score -= 1
-
-    if not pd.isna(row.get("atr", np.nan)) and not pd.isna(row.get("close", np.nan)):
-        atr_pct = row["atr"] / row["close"] * 100
-        if atr_pct < 0.02:
-            score = 0
-
-    return score
+    return "none"
 
 
-def latest_decision(df, htf_bias=0):
-    df = add_indicators(df)
-    df = add_bollinger_bands(df)
+def latest_decision(df, daily_bias=0):
+    df = add_trend(df)
+    df = add_rsi(df)
     df = add_atr(df)
-    df = add_volume_signal(df)
-    df = add_fibonacci_signal(df)
-    df = add_ict_signals(df)
     df = add_adx(df)
-    df = add_stochastic(df)
-    df = add_cci(df)
-    df = add_mfi(df)
-    df = add_vwap(df)
+    df = add_breakout_levels(df)
 
-    session_active = in_active_session()
     last_row = df.iloc[-1]
-    score = score_row(last_row, htf_bias=htf_bias, in_session=session_active)
-
-    if score >= BUY_SCORE_THRESHOLD:
-        decision = "buy"
-    elif score <= SELL_SCORE_THRESHOLD:
-        decision = "sell"
-    else:
-        decision = "none"
+    decision = decide_from_row(last_row, daily_bias=daily_bias)
 
     return {
         "decision": decision,
-        "score": score,
         "price": float(last_row["close"]),
         "atr": float(last_row["atr"]) if not pd.isna(last_row.get("atr", np.nan)) else None,
     }
@@ -598,28 +436,27 @@ def process_instrument(session, instrument, instrument_details, state, news_even
     margin_available = account["margin_available"]
 
     df = get_candles(session, instrument, GRANULARITY, CANDLE_COUNT)
-    if len(df) < 60:
+    if len(df) < 210:
         log_row({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "instrument": instrument,
             "price": None,
-            "score": None,
             "decision": "none",
             "action": "none",
             "units": 0,
             "equity": equity,
             "position": None,
-            "htf_bias": None,
+            "daily_bias": None,
             "reason": "not enough candle data yet",
         })
         return state
 
-    htf_bias = get_htf_bias(session, instrument)
-    result = latest_decision(df, htf_bias=htf_bias)
+    daily_bias = get_htf_bias(session, instrument)
+    result = latest_decision(df, daily_bias=daily_bias)
 
     decision = result["decision"]
-    score = result["score"]
     price = result["price"]
+    atr = result["atr"]
 
     current_position = get_open_position(session, instrument)
     blackout_active, blackout_event = in_news_blackout(news_events)
@@ -637,12 +474,15 @@ def process_instrument(session, instrument, instrument_details, state, news_even
         reason = f"news blackout: {blackout_event['title']}"
     elif decision == "sell" and not ALLOW_SHORTING:
         reason = "shorting disabled"
+    elif atr is None or atr <= 0:
+        reason = "invalid ATR, skipping"
     else:
         approved, state, approve_reason = approve_trade(state, equity, instrument)
         if not approved:
             reason = approve_reason
         else:
-            stop_distance = price * STOP_LOSS_PCT / 100
+            stop_distance = atr * SL_ATR_MULT
+            tp_distance = atr * TP_ATR_MULT
             risk_amount = equity * MAX_POSITION_FRACTION
             risk_based_units = int(risk_amount / stop_distance) if stop_distance > 0 else 0
 
@@ -658,8 +498,8 @@ def process_instrument(session, instrument, instrument_details, state, news_even
                 else:
                     reason = "computed 0 units (risk_amount too small vs stop_distance)"
             elif decision == "buy" and current_position <= 0:
-                sl_price = price * (1 - STOP_LOSS_PCT / 100)
-                tp_price = price * (1 + TAKE_PROFIT_PCT / 100)
+                sl_price = price - stop_distance
+                tp_price = price + tp_distance
                 order_response = place_market_order(session, instrument, units, sl_price, tp_price, price_precision)
                 if "orderFillTransaction" in order_response:
                     action = "buy"
@@ -671,8 +511,8 @@ def process_instrument(session, instrument, instrument_details, state, news_even
                 else:
                     reason = f"buy order response unclear: {json.dumps(order_response)[:300]}"
             elif decision == "sell" and current_position >= 0:
-                sl_price = price * (1 + STOP_LOSS_PCT / 100)
-                tp_price = price * (1 - TAKE_PROFIT_PCT / 100)
+                sl_price = price + stop_distance
+                tp_price = price - tp_distance
                 order_response = place_market_order(session, instrument, -units, sl_price, tp_price, price_precision)
                 if "orderFillTransaction" in order_response:
                     action = "sell"
@@ -694,17 +534,16 @@ def process_instrument(session, instrument, instrument_details, state, news_even
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "instrument": instrument,
         "price": price,
-        "score": score,
         "decision": decision,
         "action": action,
         "units": units_placed,
         "equity": equity,
         "position": current_position,
-        "htf_bias": htf_bias,
+        "daily_bias": daily_bias,
         "reason": reason,
     })
 
-    print(f"[{datetime.now(timezone.utc).isoformat()}] {instrument} price={price} score={score} decision={decision} action={action} units={units_placed} reason={reason}")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {instrument} price={price} decision={decision} action={action} units={units_placed} reason={reason}")
 
     return state
 
