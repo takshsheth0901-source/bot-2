@@ -230,3 +230,6 @@ timestamp,instrument,price,decision,action,units,equity,position,daily_bias,reas
 2026-09-20T14:23:38.600989+00:00,XAU_USD,4378.385,none,none,0,959.5304,0.0,1,no signal
 2026-09-20T14:23:38.783649+00:00,EUR_USD,1.14863,none,none,0,959.5304,0.0,-1,no signal
 2026-09-20T14:23:38.941761+00:00,GBP_USD,1.33943,none,none,0,959.5304,0.0,-1,no signal
+2026-09-20T14:36:28.548781+00:00,XAU_USD,4378.385,none,none,0,959.5304,0.0,1,no signal
+2026-09-20T14:36:28.828549+00:00,EUR_USD,1.14863,none,none,0,959.5304,0.0,-1,no signal
+2026-09-20T14:36:28.974774+00:00,GBP_USD,1.33943,none,none,0,959.5304,0.0,-1,no signal
