@@ -39,10 +39,10 @@ GRANULARITY = "M15"        # 15-minute candles — enough structure for real bre
 CANDLE_COUNT = 500
 
 # ── Strategy parameters ──
-BREAKOUT_LOOKBACK = 20      # N-candle high/low breakout
-ADX_MIN = 20                # minimum trend strength to trade at all
-RSI_UPPER = 75              # skip new longs if RSI already this overbought
-RSI_LOWER = 25              # skip new shorts if RSI already this oversold
+BREAKOUT_LOOKBACK = 12      # N-candle high/low breakout (was 20 — 3hr window instead of 5hr, catches more moves)
+ADX_MIN = 15                # minimum trend strength to trade at all (was 20 — less strict)
+RSI_UPPER = 78              # skip new longs if RSI already this overbought
+RSI_LOWER = 22              # skip new shorts if RSI already this oversold
 SL_ATR_MULT = 1.5           # stop-loss = 1.5x ATR
 TP_ATR_MULT = 3.0           # take-profit = 3.0x ATR  (~2:1 reward:risk)
 
@@ -317,8 +317,16 @@ def decide_from_row(row, daily_bias=0):
     if row["adx"] < ADX_MIN:
         return "none"  # market isn't trending enough — sit out
 
-    trend_up = row["close"] > row["ema50"] > row["ema200"]
-    trend_down = row["close"] < row["ema50"] < row["ema200"]
+    # Trend direction is price vs EMA50 only, confirmed by the daily_bias
+    # (higher-timeframe EMA20 check) rather than also requiring EMA50 to
+    # already be on the correct side of EMA200. EMA200 reacts slowly, so
+    # requiring it created a lag during the early stage of a real reversal —
+    # price and EMA50 turn first; EMA200 catches up later. Dropping that
+    # extra stacking requirement lets the bot catch reversals earlier,
+    # while daily_bias (a separate, higher-timeframe signal) still guards
+    # against trading directly against the bigger picture.
+    trend_up = row["close"] > row["ema50"]
+    trend_down = row["close"] < row["ema50"]
 
     if trend_up and daily_bias >= 0:
         if row["close"] > row["breakout_high"] and row["rsi"] < RSI_UPPER:
