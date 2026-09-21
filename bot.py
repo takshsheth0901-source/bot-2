@@ -341,10 +341,19 @@ def latest_decision(df, daily_bias=0):
     last_row = df.iloc[-1]
     decision = decide_from_row(last_row, daily_bias=daily_bias)
 
+    def safe_float(val):
+        return float(val) if not pd.isna(val) else None
+
     return {
         "decision": decision,
         "price": float(last_row["close"]),
-        "atr": float(last_row["atr"]) if not pd.isna(last_row.get("atr", np.nan)) else None,
+        "atr": safe_float(last_row.get("atr", np.nan)),
+        "adx": safe_float(last_row.get("adx", np.nan)),
+        "rsi": safe_float(last_row.get("rsi", np.nan)),
+        "ema50": safe_float(last_row.get("ema50", np.nan)),
+        "ema200": safe_float(last_row.get("ema200", np.nan)),
+        "breakout_high": safe_float(last_row.get("breakout_high", np.nan)),
+        "breakout_low": safe_float(last_row.get("breakout_low", np.nan)),
     }
 
 
@@ -467,6 +476,12 @@ def process_instrument(session, instrument, instrument_details, state, news_even
             "position": None,
             "daily_bias": None,
             "reason": "not enough candle data yet",
+            "adx": None,
+            "rsi": None,
+            "ema50": None,
+            "ema200": None,
+            "breakout_high": None,
+            "breakout_low": None,
         })
         return state
 
@@ -476,6 +491,12 @@ def process_instrument(session, instrument, instrument_details, state, news_even
     decision = result["decision"]
     price = result["price"]
     atr = result["atr"]
+    diag_adx = result["adx"]
+    diag_rsi = result["rsi"]
+    diag_ema50 = result["ema50"]
+    diag_ema200 = result["ema200"]
+    diag_breakout_high = result["breakout_high"]
+    diag_breakout_low = result["breakout_low"]
 
     current_position = get_open_position(session, instrument)
     blackout_active, blackout_event = in_news_blackout(news_events)
@@ -560,6 +581,12 @@ def process_instrument(session, instrument, instrument_details, state, news_even
         "position": current_position,
         "daily_bias": daily_bias,
         "reason": reason,
+        "adx": diag_adx,
+        "rsi": diag_rsi,
+        "ema50": diag_ema50,
+        "ema200": diag_ema200,
+        "breakout_high": diag_breakout_high,
+        "breakout_low": diag_breakout_low,
     })
 
     print(f"[{datetime.now(timezone.utc).isoformat()}] {instrument} price={price} decision={decision} action={action} units={units_placed} reason={reason}")
