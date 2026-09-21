@@ -317,22 +317,22 @@ def decide_from_row(row, daily_bias=0):
     if row["adx"] < ADX_MIN:
         return "none"  # market isn't trending enough — sit out
 
-    # Trend direction is price vs EMA50 only, confirmed by the daily_bias
-    # (higher-timeframe EMA20 check) rather than also requiring EMA50 to
-    # already be on the correct side of EMA200. EMA200 reacts slowly, so
-    # requiring it created a lag during the early stage of a real reversal —
-    # price and EMA50 turn first; EMA200 catches up later. Dropping that
-    # extra stacking requirement lets the bot catch reversals earlier,
-    # while daily_bias (a separate, higher-timeframe signal) still guards
-    # against trading directly against the bigger picture.
+    # Trend direction is price vs EMA50 only (see prior comment on why EMA200
+    # stacking was dropped). daily_bias is now logged for context but no
+    # longer required to agree before entering: it's computed from the daily
+    # candle's EMA20, so it only updates ~once a day and was observed sitting
+    # stuck disagreeing with the live M15 trend across all three pairs for a
+    # full session, blocking otherwise-valid setups (ADX + trend + breakout
+    # all aligned) purely on a stale higher-timeframe read. ADX, EMA50 trend,
+    # and the breakout confirmation are the real filters now.
     trend_up = row["close"] > row["ema50"]
     trend_down = row["close"] < row["ema50"]
 
-    if trend_up and daily_bias >= 0:
+    if trend_up:
         if row["close"] > row["breakout_high"] and row["rsi"] < RSI_UPPER:
             return "buy"
 
-    if trend_down and daily_bias <= 0:
+    if trend_down:
         if row["close"] < row["breakout_low"] and row["rsi"] > RSI_LOWER:
             return "sell"
 
