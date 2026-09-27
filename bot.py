@@ -195,8 +195,13 @@ def get_candles(session, instrument, granularity, count):
 # ══════════════════════════════════════════════════════════════════════════
 
 def add_trend(df):
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+    # Simplified from the EMA50/EMA200 breakout system to a classic fast/slow
+    # EMA crossover: fast EMA above slow EMA = uptrend, below = downtrend.
+    # Fewer moving parts, easier to reason about, and no separate breakout
+    # confirmation required (that was the main source of missed/blocked
+    # trades in the previous version).
+    df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
     return df
 
 
@@ -308,8 +313,16 @@ def in_news_blackout(news_events):
 # ══════════════════════════════════════════════════════════════════════════
 
 def decide_from_row(row, daily_bias=0):
-    """Trend + breakout + strength filter. Returns 'buy' / 'sell' / 'none'."""
-    required = ["ema50", "ema200", "adx", "rsi", "atr", "breakout_high", "breakout_low", "close"]
+    """Simple fast/slow EMA crossover + ADX strength filter. Returns 'buy' / 'sell' / 'none'.
+
+    This replaces the breakout-confirmation system: same core idea (only trade
+    with the trend, only when it's a real trend per ADX) but with one less
+    gate. Fewer conditions that all have to align at once means it fires more
+    often — that also means more false signals in choppy stretches, which is
+    a real cost, not a free win. RSI still blocks entries that are already
+    stretched, as a light sanity check.
+    """
+    required = ["ema_fast", "ema_slow", "adx", "rsi", "atr", "close"]
     for col in required:
         if pd.isna(row.get(col, np.nan)):
             return "none"
@@ -317,24 +330,11 @@ def decide_from_row(row, daily_bias=0):
     if row["adx"] < ADX_MIN:
         return "none"  # market isn't trending enough — sit out
 
-    # Trend direction is price vs EMA50 only (see prior comment on why EMA200
-    # stacking was dropped). daily_bias is now logged for context but no
-    # longer required to agree before entering: it's computed from the daily
-    # candle's EMA20, so it only updates ~once a day and was observed sitting
-    # stuck disagreeing with the live M15 trend across all three pairs for a
-    # full session, blocking otherwise-valid setups (ADX + trend + breakout
-    # all aligned) purely on a stale higher-timeframe read. ADX, EMA50 trend,
-    # and the breakout confirmation are the real filters now.
-    trend_up = row["close"] > row["ema50"]
-    trend_down = row["close"] < row["ema50"]
+    if row["ema_fast"] > row["ema_slow"] and row["rsi"] < RSI_UPPER:
+        return "buy"
 
-    if trend_up:
-        if row["close"] > row["breakout_high"] and row["rsi"] < RSI_UPPER:
-            return "buy"
-
-    if trend_down:
-        if row["close"] < row["breakout_low"] and row["rsi"] > RSI_LOWER:
-            return "sell"
+    if row["ema_fast"] < row["ema_slow"] and row["rsi"] > RSI_LOWER:
+        return "sell"
 
     return "none"
 
@@ -344,7 +344,6 @@ def latest_decision(df, daily_bias=0):
     df = add_rsi(df)
     df = add_atr(df)
     df = add_adx(df)
-    df = add_breakout_levels(df)
 
     last_row = df.iloc[-1]
     decision = decide_from_row(last_row, daily_bias=daily_bias)
@@ -358,10 +357,8 @@ def latest_decision(df, daily_bias=0):
         "atr": safe_float(last_row.get("atr", np.nan)),
         "adx": safe_float(last_row.get("adx", np.nan)),
         "rsi": safe_float(last_row.get("rsi", np.nan)),
-        "ema50": safe_float(last_row.get("ema50", np.nan)),
-        "ema200": safe_float(last_row.get("ema200", np.nan)),
-        "breakout_high": safe_float(last_row.get("breakout_high", np.nan)),
-        "breakout_low": safe_float(last_row.get("breakout_low", np.nan)),
+        "ema_fast": safe_float(last_row.get("ema_fast", np.nan)),
+        "ema_slow": safe_float(last_row.get("ema_slow", np.nan)),
     }
 
 
@@ -472,7 +469,7 @@ def process_instrument(session, instrument, instrument_details, state, news_even
     margin_available = account["margin_available"]
 
     df = get_candles(session, instrument, GRANULARITY, CANDLE_COUNT)
-    if len(df) < 210:  # need enough for EMA200 to be meaningful
+    if len(df) < 30:  # need enough for EMA21/ADX to be meaningful
         log_row({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "instrument": instrument,
@@ -486,10 +483,8 @@ def process_instrument(session, instrument, instrument_details, state, news_even
             "reason": "not enough candle data yet",
             "adx": None,
             "rsi": None,
-            "ema50": None,
-            "ema200": None,
-            "breakout_high": None,
-            "breakout_low": None,
+            "ema_fast": None,
+            "ema_slow": None,
         })
         return state
 
@@ -501,10 +496,8 @@ def process_instrument(session, instrument, instrument_details, state, news_even
     atr = result["atr"]
     diag_adx = result["adx"]
     diag_rsi = result["rsi"]
-    diag_ema50 = result["ema50"]
-    diag_ema200 = result["ema200"]
-    diag_breakout_high = result["breakout_high"]
-    diag_breakout_low = result["breakout_low"]
+    diag_ema_fast = result["ema_fast"]
+    diag_ema_slow = result["ema_slow"]
 
     current_position = get_open_position(session, instrument)
     blackout_active, blackout_event = in_news_blackout(news_events)
@@ -591,10 +584,8 @@ def process_instrument(session, instrument, instrument_details, state, news_even
         "reason": reason,
         "adx": diag_adx,
         "rsi": diag_rsi,
-        "ema50": diag_ema50,
-        "ema200": diag_ema200,
-        "breakout_high": diag_breakout_high,
-        "breakout_low": diag_breakout_low,
+        "ema_fast": diag_ema_fast,
+        "ema_slow": diag_ema_slow,
     })
 
     print(f"[{datetime.now(timezone.utc).isoformat()}] {instrument} price={price} decision={decision} action={action} units={units_placed} reason={reason}")
